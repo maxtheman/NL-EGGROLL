@@ -19,6 +19,7 @@ from eggroll_mlx import (
     convert_fitnesses,
     do_mm,
     generate_big_rand,
+    int8_matmul,
 )
 
 
@@ -87,7 +88,7 @@ def forward_int8(cfg: NoiseConfig, w: TransformerWeights, x_tokens: mx.array, bi
     pos = w.pos_emb[:S]
     h = mx.clip(tok + pos, -127, 127).astype(mx.int8)
 
-    # Self-attention (single layer, no masking sophistication)
+    # Self-attention (single layer, argmax attention; no softmax)
     def proj(h_in, linear: Int8Linear, tid_offset):
         out = do_mm(cfg, h_in.reshape(-1, d_model), linear.weight, big_rand, epoch, tid_offset, base_seed)
         out = (out // linear.scale).astype(mx.int8)
@@ -96,11 +97,17 @@ def forward_int8(cfg: NoiseConfig, w: TransformerWeights, x_tokens: mx.array, bi
     q = proj(h, w.attn_q, tid_offset=0)
     k = proj(h, w.attn_k, tid_offset=1)
     v = proj(h, w.attn_v, tid_offset=2)
-    # attention scores: q @ k^T / sqrt(d_head) in int32
     d_head = q.shape[-1]
-    scores = mx.matmul(q.astype(mx.float32), mx.swapaxes(k.astype(mx.float32), -1, -2)) / float(np.sqrt(d_head))
-    attn = mx.softmax(scores, axis=-1)
-    ctx = mx.matmul(attn, v.astype(mx.float32)).astype(mx.int8)
+    q_flat = mx.reshape(q, (B * S, d_head))
+    k_flat = mx.reshape(k, (B * S, d_head))
+    scores = int8_matmul(q_flat, k_flat)  # (B*S, B*S) int32
+    # scale scores to prevent overflow; simple integer divide by sqrt(d_head)
+    scores = scores // max(1, int(np.sqrt(d_head)))
+    # argmax attention: pick best key per query
+    idx = mx.argmax(scores, axis=-1)  # (B*S,)
+    ctx_flat = v.reshape(B * S, d_head)
+    gathered = ctx_flat[idx]  # (B*S, d_head)
+    ctx = mx.reshape(gathered, (B, S, d_head)).astype(mx.int8)
     attn_out = proj(ctx, w.attn_out, tid_offset=3)
 
     # MLP
