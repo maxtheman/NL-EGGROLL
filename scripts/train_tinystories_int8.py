@@ -65,6 +65,7 @@ def main():
     parser.add_argument("--fixed_point", type=int, default=4)
     parser.add_argument("--sigma_shift", type=int, default=4)
     parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--save_dir", type=str, default="checkpoints/int8_baseline", help="where to save emb/w_out")
     args = parser.parse_args()
 
     rng = np.random.default_rng(args.seed)
@@ -100,6 +101,13 @@ def main():
         logits_eval = do_mm(cfg, h_eval, w_out, None, None, None, None).astype(mx.float32)
         loss = cross_entropy(logits_eval, y)
         print(f"step {step}: loss={loss.item():.4f}, logits_max={float(np.array(logits_eval).max()):.1f}")
+
+    # Save learned parameters
+    save_dir = Path(args.save_dir)
+    save_dir.mkdir(parents=True, exist_ok=True)
+    np.save(save_dir / "emb.npy", np.array(emb))
+    np.save(save_dir / "w_out.npy", np.array(w_out))
+    print("Saved checkpoint to", save_dir)
 
 
 if __name__ == "__main__":
