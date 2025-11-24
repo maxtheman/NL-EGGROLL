@@ -62,10 +62,12 @@ def main():
     parser.add_argument("--d_model", type=int, default=256)
     parser.add_argument("--pop_size", type=int, default=16)
     parser.add_argument("--steps", type=int, default=50)
-    parser.add_argument("--fixed_point", type=int, default=4)
+    parser.add_argument("--fixed_point", type=int, default=2)
     parser.add_argument("--sigma_shift", type=int, default=4)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--save_dir", type=str, default="checkpoints/int8_baseline", help="where to save emb/w_out")
+    parser.add_argument("--batch_size", type=int, default=64)
+    parser.add_argument("--init_scale", type=float, default=1.0, help="multiplicative scale before quantize")
     args = parser.parse_args()
 
     rng = np.random.default_rng(args.seed)
@@ -79,11 +81,11 @@ def main():
     big_rand = generate_big_rand(2_000_000, seed=args.seed, fixed_point=cfg.fixed_point, dtype=mx.int8)
 
     # Parameters: embeddings (vocab x d_model), output (vocab x d_model)
-    emb = quantize(rng.normal(0, 0.05, size=(args.vocab_size, args.d_model)), cfg.fixed_point)
-    w_out = quantize(rng.normal(0, 0.05, size=(args.vocab_size, args.d_model)), cfg.fixed_point)
+    emb = quantize(rng.normal(0, 0.05, size=(args.vocab_size, args.d_model)) * args.init_scale, cfg.fixed_point)
+    w_out = quantize(rng.normal(0, 0.05, size=(args.vocab_size, args.d_model)) * args.init_scale, cfg.fixed_point)
 
     for step in range(args.steps):
-        x_last, y = get_batch(memmap, args.seq_len, batch_size=32, vocab_size=args.vocab_size, rng=rng)
+        x_last, y = get_batch(memmap, args.seq_len, batch_size=args.batch_size, vocab_size=args.vocab_size, rng=rng)
         rewards = []
         for j in range(args.pop_size):
             thread_id = j
