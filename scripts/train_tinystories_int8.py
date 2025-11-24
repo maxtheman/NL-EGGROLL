@@ -5,8 +5,9 @@ Uses ES-style sign updates via apply_sign_update.
 """
 
 import argparse
-import math
+from dataclasses import dataclass
 from pathlib import Path
+from typing import List, Tuple
 
 import numpy as np
 import mlx.core as mx
@@ -14,6 +15,7 @@ import mlx.core as mx
 from eggroll_mlx import (
     NoiseConfig,
     apply_sign_update,
+    calibrate_divisor,
     convert_fitnesses,
     do_mm,
     generate_big_rand,
@@ -33,15 +35,13 @@ def get_batch(memmap, seq_len, batch_size, vocab_size, rng):
     arr = arr.reshape(batch_size, seq_len)
     x = arr[:, :-1]
     y = arr[:, -1]  # predict last token
-    x_last = x[:, -1]  # last input token
-    # to int32 for indexing
-    x_last = mx.array(x_last.astype(np.int32))
+    x = mx.array(x.astype(np.int32))
     y = mx.array(y.astype(np.int32))
-    return x_last, y
+    return x, y
 
 
-def quantize(arr, fixed_point):
-    scaled = np.clip(np.round(arr * (2**fixed_point)), -127, 127).astype(np.int8)
+def quantize(arr, fixed_point, scale=1.0):
+    scaled = np.clip(np.round(arr * scale * (2**fixed_point)), -127, 127).astype(np.int8)
     return mx.array(scaled, dtype=mx.int8)
 
 
@@ -54,12 +54,115 @@ def cross_entropy(logits, targets):
     return -mx.mean(mx.sum(one_hot * log_probs, axis=-1))
 
 
+@dataclass
+class Int8Linear:
+    weight: mx.array  # (out, in)
+    scale: int  # divisor after matmul
+
+
+@dataclass
+class TransformerWeights:
+    tok_emb: mx.array  # (vocab, d_model)
+    pos_emb: mx.array  # (seq_len, d_model)
+    attn_q: Int8Linear
+    attn_k: Int8Linear
+    attn_v: Int8Linear
+    attn_out: Int8Linear
+    mlp_in: Int8Linear
+    mlp_out: Int8Linear
+    lm_head: Int8Linear
+
+
+def calibrate_linear(x_sample: mx.array, w_int8: mx.array, target_max=32) -> int:
+    div = calibrate_divisor(x_sample.astype(mx.int8), w_int8, target_max=target_max)
+    return max(1, div)
+
+
+def forward_int8(cfg: NoiseConfig, w: TransformerWeights, x_tokens: mx.array, big_rand, epoch, base_seed):
+    # x_tokens: (batch, seq)
+    B, S = x_tokens.shape
+    d_model = w.tok_emb.shape[1]
+    # embeddings
+    tok = w.tok_emb[x_tokens]  # (B,S,d)
+    pos = w.pos_emb[:S]
+    h = mx.clip(tok + pos, -127, 127).astype(mx.int8)
+
+    # Self-attention (single layer, no masking sophistication)
+    def proj(h_in, linear: Int8Linear, tid_offset):
+        out = do_mm(cfg, h_in.reshape(-1, d_model), linear.weight, big_rand, epoch, tid_offset, base_seed)
+        out = (out // linear.scale).astype(mx.int8)
+        return mx.reshape(out, (B, S, -1))
+
+    q = proj(h, w.attn_q, tid_offset=0)
+    k = proj(h, w.attn_k, tid_offset=1)
+    v = proj(h, w.attn_v, tid_offset=2)
+    # attention scores: q @ k^T / sqrt(d_head) in int32
+    d_head = q.shape[-1]
+    scores = mx.matmul(q.astype(mx.float32), mx.swapaxes(k.astype(mx.float32), -1, -2)) / float(np.sqrt(d_head))
+    attn = mx.softmax(scores, axis=-1)
+    ctx = mx.matmul(attn, v.astype(mx.float32)).astype(mx.int8)
+    attn_out = proj(ctx, w.attn_out, tid_offset=3)
+
+    # MLP
+    mlp_hidden = proj(attn_out, w.mlp_in, tid_offset=4)
+    mlp_hidden = mx.maximum(mlp_hidden, mx.zeros_like(mlp_hidden))
+    mlp_out = proj(mlp_hidden, w.mlp_out, tid_offset=5)
+
+    # LM head on last token
+    last = mlp_out[:, -1, :]
+    logits_int = do_mm(cfg, last, w.lm_head.weight, big_rand, epoch, tid_offset=6, base_seed=base_seed)
+    logits = (logits_int // w.lm_head.scale).astype(mx.float32)
+    return logits
+
+
+def init_weights(cfg: NoiseConfig, vocab_size: int, seq_len: int, d_model: int, d_head: int, d_ff: int, rng, init_scale):
+    def q(shape):
+        return quantize(rng.normal(0, 0.05, size=shape), cfg.fixed_point, scale=init_scale)
+
+    tok_emb = q((vocab_size, d_model))
+    pos_emb = q((seq_len, d_model))
+    attn_q_w = q((d_head, d_model))
+    attn_k_w = q((d_head, d_model))
+    attn_v_w = q((d_head, d_model))
+    attn_out_w = q((d_model, d_head))
+    mlp_in_w = q((d_ff, d_model))
+    mlp_out_w = q((d_model, d_ff))
+    lm_head_w = q((vocab_size, d_model))
+
+    # simple calibration using small random batch
+    dummy = mx.array(rng.integers(0, vocab_size, size=(4,)), dtype=mx.int32)
+    dummy_emb = tok_emb[dummy]
+    scales = {
+        "q": calibrate_linear(dummy_emb.reshape(-1, d_model), attn_q_w),
+        "k": calibrate_linear(dummy_emb.reshape(-1, d_model), attn_k_w),
+        "v": calibrate_linear(dummy_emb.reshape(-1, d_model), attn_v_w),
+        "o": calibrate_linear(dummy_emb.reshape(-1, d_head), attn_out_w),
+        "mlp_in": calibrate_linear(dummy_emb.reshape(-1, d_model), mlp_in_w),
+        "mlp_out": calibrate_linear(dummy_emb.reshape(-1, d_ff), mlp_out_w),
+        "lm": calibrate_linear(dummy_emb.reshape(-1, d_model), lm_head_w),
+    }
+
+    return TransformerWeights(
+        tok_emb=tok_emb,
+        pos_emb=pos_emb,
+        attn_q=Int8Linear(attn_q_w, scales["q"]),
+        attn_k=Int8Linear(attn_k_w, scales["k"]),
+        attn_v=Int8Linear(attn_v_w, scales["v"]),
+        attn_out=Int8Linear(attn_out_w, scales["o"]),
+        mlp_in=Int8Linear(mlp_in_w, scales["mlp_in"]),
+        mlp_out=Int8Linear(mlp_out_w, scales["mlp_out"]),
+        lm_head=Int8Linear(lm_head_w, scales["lm"]),
+    )
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--data_dir", type=str, default="data/tinystories")
     parser.add_argument("--seq_len", type=int, default=128)
     parser.add_argument("--vocab_size", type=int, default=10_000)
     parser.add_argument("--d_model", type=int, default=256)
+    parser.add_argument("--d_head", type=int, default=64)
+    parser.add_argument("--d_ff", type=int, default=1024)
     parser.add_argument("--pop_size", type=int, default=16)
     parser.add_argument("--steps", type=int, default=50)
     parser.add_argument("--fixed_point", type=int, default=2)
@@ -78,37 +181,39 @@ def main():
 
     cfg = NoiseConfig(fixed_point=args.fixed_point, sigma_shift=args.sigma_shift, rank=1)
     base_seed = args.seed
-    big_rand = generate_big_rand(2_000_000, seed=args.seed, fixed_point=cfg.fixed_point, dtype=mx.int8)
+    big_rand = generate_big_rand(4_000_000, seed=args.seed, fixed_point=cfg.fixed_point, dtype=mx.int8)
 
-    # Parameters: embeddings (vocab x d_model), output (vocab x d_model)
-    emb = quantize(rng.normal(0, 0.05, size=(args.vocab_size, args.d_model)) * args.init_scale, cfg.fixed_point)
-    w_out = quantize(rng.normal(0, 0.05, size=(args.vocab_size, args.d_model)) * args.init_scale, cfg.fixed_point)
+    weights = init_weights(cfg, args.vocab_size, args.seq_len, args.d_model, args.d_head, args.d_ff, rng, args.init_scale)
 
     for step in range(args.steps):
-        x_last, y = get_batch(memmap, args.seq_len, batch_size=args.batch_size, vocab_size=args.vocab_size, rng=rng)
+        x, y = get_batch(memmap, args.seq_len, batch_size=args.batch_size, vocab_size=args.vocab_size, rng=rng)
         rewards = []
         for j in range(args.pop_size):
-            thread_id = j
-            # gather embeddings
-            h_int = emb[x_last]  # (batch, d_model) int8
-            logits_int = do_mm(cfg, h_int, w_out, big_rand, epoch=step, thread_id=thread_id, base_seed=base_seed)
-            logits = logits_int.astype(mx.float32)
+            logits = forward_int8(cfg, weights, x, big_rand, epoch=step, base_seed=base_seed)
             rewards.append(-cross_entropy(logits, y).item())
         rewards = mx.array(rewards)
         fitnesses = convert_fitnesses(cfg, rewards)
-        w_out = apply_sign_update(cfg, w_out, fitnesses, big_rand, step, base_seed)
+        # Update only lm_head for now (extend to all matrices iteratively)
+        weights.lm_head.weight = apply_sign_update(cfg, weights.lm_head.weight, fitnesses, big_rand, step, base_seed)
 
-        # eval on the same batch
-        h_eval = emb[x_last]
-        logits_eval = do_mm(cfg, h_eval, w_out, None, None, None, None).astype(mx.float32)
+        logits_eval = forward_int8(cfg, weights, x, big_rand=None, epoch=None, base_seed=None)
         loss = cross_entropy(logits_eval, y)
-        print(f"step {step}: loss={loss.item():.4f}, logits_max={float(np.array(logits_eval).max()):.1f}")
+        lmax = float(np.array(logits_eval).max())
+        print(f"step {step}: loss={loss.item():.4f}, logits_max={lmax:.1f}")
 
     # Save learned parameters
     save_dir = Path(args.save_dir)
     save_dir.mkdir(parents=True, exist_ok=True)
-    np.save(save_dir / "emb.npy", np.array(emb))
-    np.save(save_dir / "w_out.npy", np.array(w_out))
+    np.save(save_dir / "tok_emb.npy", np.array(weights.tok_emb))
+    np.save(save_dir / "pos_emb.npy", np.array(weights.pos_emb))
+    np.save(save_dir / "attn_q.npy", np.array(weights.attn_q.weight))
+    np.save(save_dir / "attn_k.npy", np.array(weights.attn_k.weight))
+    np.save(save_dir / "attn_v.npy", np.array(weights.attn_v.weight))
+    np.save(save_dir / "attn_out.npy", np.array(weights.attn_out.weight))
+    np.save(save_dir / "mlp_in.npy", np.array(weights.mlp_in.weight))
+    np.save(save_dir / "mlp_out.npy", np.array(weights.mlp_out.weight))
+    np.save(save_dir / "lm_head.npy", np.array(weights.lm_head.weight))
+    np.save(save_dir / "scales.npy", np.array([weights.attn_q.scale, weights.attn_k.scale, weights.attn_v.scale, weights.attn_out.scale, weights.mlp_in.scale, weights.mlp_out.scale, weights.lm_head.scale]))
     print("Saved checkpoint to", save_dir)
 
 
