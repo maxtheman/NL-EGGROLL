@@ -1,0 +1,266 @@
+{
+  "fileType": "https://jsoncanvas.org",
+  "version": "1.0",
+  "nodes": [
+    {
+      "id": "root",
+      "type": "text",
+      "x": 0,
+      "y": 0,
+      "width": 300,
+      "height": 120,
+      "label": "Nested Learning + EGGROLL Stack\n(Plan + Roadmap)"
+    },
+    {
+      "id": "plan",
+      "type": "file",
+      "x": 360,
+      "y": 0,
+      "width": 220,
+      "height": 120,
+      "file": "../research_plan.md",
+      "label": "Plan"
+    },
+    {
+      "id": "notes_eggroll",
+      "type": "file",
+      "x": 0,
+      "y": 120,
+      "width": 240,
+      "height": 80,
+      "file": "../notes/eggroll.md",
+      "label": "Notes: EGGROLL"
+    },
+    {
+      "id": "notes_nested",
+      "type": "file",
+      "x": 260,
+      "y": 120,
+      "width": 240,
+      "height": 80,
+      "file": "../notes/nested_learning.md",
+      "label": "Notes: Nested Learning"
+    },
+    {
+      "id": "notes_titans",
+      "type": "file",
+      "x": 520,
+      "y": 120,
+      "width": 240,
+      "height": 80,
+      "file": "../notes/titans.md",
+      "label": "Notes: Titans"
+    },
+    {
+      "id": "notes_titans_explained",
+      "type": "file",
+      "x": 780,
+      "y": 120,
+      "width": 240,
+      "height": 80,
+      "file": "../notes/titans_explained.md",
+      "label": "Notes: Titans Explained"
+    },
+    {
+      "id": "eggroll",
+      "type": "file",
+      "x": 0,
+      "y": 220,
+      "width": 240,
+      "height": 120,
+      "file": "../EGGROLL.pdf",
+      "label": "EGGROLL (ES)"
+    },
+    {
+      "id": "nested",
+      "type": "file",
+      "x": 260,
+      "y": 220,
+      "width": 240,
+      "height": 120,
+      "file": "../nestedlearning.pdf",
+      "label": "Nested Learning / HOPE"
+    },
+    {
+      "id": "titans",
+      "type": "file",
+      "x": 520,
+      "y": 220,
+      "width": 240,
+      "height": 120,
+      "file": "../titans.pdf",
+      "label": "Titans"
+    },
+    {
+      "id": "titans_explained",
+      "type": "file",
+      "x": 780,
+      "y": 220,
+      "width": 240,
+      "height": 120,
+      "file": "../titans-explained.pdf",
+      "label": "Titans Explained"
+    },
+    {
+      "id": "docs",
+      "type": "text",
+      "x": 0,
+      "y": 360,
+      "width": 260,
+      "height": 120,
+      "label": "Docs"
+    },
+    {
+      "id": "doc_mlx",
+      "type": "file",
+      "x": 0,
+      "y": 500,
+      "width": 240,
+      "height": 80,
+      "file": "../docs/mlx-index.html",
+      "label": "Docs: MLX"
+    },
+    {
+      "id": "doc_marimo",
+      "type": "file",
+      "x": 260,
+      "y": 500,
+      "width": 240,
+      "height": 80,
+      "file": "../docs/marimo-index.html",
+      "label": "Docs: marimo"
+    },
+    {
+      "id": "doc_uv",
+      "type": "file",
+      "x": 520,
+      "y": 500,
+      "width": 240,
+      "height": 80,
+      "file": "../docs/uv-index.html",
+      "label": "Docs: uv"
+    },
+    {
+      "id": "doc_eggroll",
+      "type": "file",
+      "x": 780,
+      "y": 500,
+      "width": 240,
+      "height": 80,
+      "file": "../docs/eggroll-index.html",
+      "label": "Docs: eggroll site"
+    },
+    {
+      "id": "notebooks",
+      "type": "text",
+      "x": 280,
+      "y": 360,
+      "width": 260,
+      "height": 120,
+      "label": "Marimo notebooks"
+    },
+    {
+      "id": "nb_eggroll",
+      "type": "file",
+      "x": 280,
+      "y": 500,
+      "width": 240,
+      "height": 80,
+      "file": "../notebooks/eggroll_claims.py",
+      "label": "NB: EGGROLL"
+    },
+    {
+      "id": "nb_nested",
+      "type": "file",
+      "x": 540,
+      "y": 500,
+      "width": 240,
+      "height": 80,
+      "file": "../notebooks/nested_learning_claims.py",
+      "label": "NB: Nested Learning"
+    },
+    {
+      "id": "nb_titans",
+      "type": "file",
+      "x": 800,
+      "y": 500,
+      "width": 240,
+      "height": 80,
+      "file": "../notebooks/titans_claims.py",
+      "label": "NB: Titans"
+    },
+    {
+      "id": "nb_titans_explained",
+      "type": "file",
+      "x": 1060,
+      "y": 500,
+      "width": 240,
+      "height": 80,
+      "file": "../notebooks/titans_explained_claims.py",
+      "label": "NB: Titans Explained"
+    },
+    {
+      "id": "nb_integration",
+      "type": "file",
+      "x": 1320,
+      "y": 500,
+      "width": 240,
+      "height": 80,
+      "file": "../notebooks/integration_lab.py",
+      "label": "NB: Integration Lab"
+    },
+    {
+      "id": "integration",
+      "type": "text",
+      "x": 560,
+      "y": 360,
+      "width": 260,
+      "height": 120,
+      "label": "Integration Lab\nHOPE/Titans-lite + EGGROLL\n(curriculum tasks)"
+    },
+    {
+      "id": "critique",
+      "type": "text",
+      "x": 840,
+      "y": 360,
+      "width": 260,
+      "height": 120,
+      "label": "Critique Loop\n- intuition writeups\n- reviewer prompts\n- change log"
+    },
+    {
+      "id": "third_party",
+      "type": "file",
+      "x": 1120,
+      "y": 360,
+      "width": 260,
+      "height": 120,
+      "file": "../third_party_references/README.md",
+      "label": "3rd Party Refs\n(repos + docs)"
+    }
+  ],
+  "edges": [
+    {"id": "e1", "fromNode": "root", "toNode": "plan"},
+    {"id": "e2", "fromNode": "root", "toNode": "notes_eggroll"},
+    {"id": "e3", "fromNode": "root", "toNode": "notes_nested"},
+    {"id": "e4", "fromNode": "root", "toNode": "notes_titans"},
+    {"id": "e5", "fromNode": "root", "toNode": "notes_titans_explained"},
+    {"id": "e6", "fromNode": "root", "toNode": "eggroll"},
+    {"id": "e7", "fromNode": "root", "toNode": "nested"},
+    {"id": "e8", "fromNode": "root", "toNode": "titans"},
+    {"id": "e9", "fromNode": "root", "toNode": "titans_explained"},
+    {"id": "e10", "fromNode": "root", "toNode": "docs"},
+    {"id": "e11", "fromNode": "docs", "toNode": "doc_mlx"},
+    {"id": "e12", "fromNode": "docs", "toNode": "doc_marimo"},
+    {"id": "e13", "fromNode": "docs", "toNode": "doc_uv"},
+    {"id": "e14", "fromNode": "docs", "toNode": "doc_eggroll"},
+    {"id": "e15", "fromNode": "root", "toNode": "notebooks"},
+    {"id": "e16", "fromNode": "notebooks", "toNode": "nb_eggroll"},
+    {"id": "e17", "fromNode": "notebooks", "toNode": "nb_nested"},
+    {"id": "e18", "fromNode": "notebooks", "toNode": "nb_titans"},
+    {"id": "e19", "fromNode": "notebooks", "toNode": "nb_titans_explained"},
+    {"id": "e20", "fromNode": "notebooks", "toNode": "nb_integration"},
+    {"id": "e21", "fromNode": "root", "toNode": "integration"},
+    {"id": "e22", "fromNode": "root", "toNode": "critique"},
+    {"id": "e23", "fromNode": "root", "toNode": "third_party"}
+  ]
+}
