@@ -1,3 +1,4 @@
+import os
 import sys
 from pathlib import Path
 
@@ -15,6 +16,7 @@ import jax
 import jax.numpy as jnp
 _argv_backup = sys.argv
 sys.argv = ["nano-egg"]  # prevent tyro CLI from parsing pytest args
+os.environ["NANO_EGG_NO_CLI"] = "1"
 import run as nano  # type: ignore
 sys.argv = _argv_backup
 

@@ -88,26 +88,21 @@ def forward_int8(cfg: NoiseConfig, w: TransformerWeights, x_tokens: mx.array, bi
     pos = w.pos_emb[:S]
     h = mx.clip(tok + pos, -127, 127).astype(mx.int8)
 
-    # Self-attention (single layer, argmax attention; no softmax)
     def proj(h_in, linear: Int8Linear, tid_offset):
-        out = do_mm(cfg, h_in.reshape(-1, d_model), linear.weight, big_rand, epoch, tid_offset, base_seed)
+        in_dim = linear.weight.shape[1]
+        out = do_mm(cfg, h_in.reshape(-1, in_dim), linear.weight, big_rand, epoch, thread_id=tid_offset, base_seed=base_seed)
         out = (out // linear.scale).astype(mx.int8)
-        return mx.reshape(out, (B, S, -1))
+        out_dim = linear.weight.shape[0]
+        return mx.reshape(out, (B, S, out_dim))
 
+    # Self-attention with float softmax (float scores only, projections int8)
     q = proj(h, w.attn_q, tid_offset=0)
     k = proj(h, w.attn_k, tid_offset=1)
     v = proj(h, w.attn_v, tid_offset=2)
     d_head = q.shape[-1]
-    q_flat = mx.reshape(q, (B * S, d_head))
-    k_flat = mx.reshape(k, (B * S, d_head))
-    scores = int8_matmul(q_flat, k_flat)  # (B*S, B*S) int32
-    # scale scores to prevent overflow; simple integer divide by sqrt(d_head)
-    scores = scores // max(1, int(np.sqrt(d_head)))
-    # argmax attention: pick best key per query
-    idx = mx.argmax(scores, axis=-1)  # (B*S,)
-    ctx_flat = v.reshape(B * S, d_head)
-    gathered = ctx_flat[idx]  # (B*S, d_head)
-    ctx = mx.reshape(gathered, (B, S, d_head)).astype(mx.int8)
+    scores = mx.matmul(q.astype(mx.float32), mx.swapaxes(k.astype(mx.float32), -1, -2)) / float(np.sqrt(d_head))
+    attn = mx.softmax(scores, axis=-1)
+    ctx = mx.matmul(attn, v.astype(mx.float32)).astype(mx.int8)
     attn_out = proj(ctx, w.attn_out, tid_offset=3)
 
     # MLP
@@ -117,7 +112,7 @@ def forward_int8(cfg: NoiseConfig, w: TransformerWeights, x_tokens: mx.array, bi
 
     # LM head on last token
     last = mlp_out[:, -1, :]
-    logits_int = do_mm(cfg, last, w.lm_head.weight, big_rand, epoch, tid_offset=6, base_seed=base_seed)
+    logits_int = do_mm(cfg, last, w.lm_head.weight, big_rand, epoch, thread_id=6, base_seed=base_seed)
     logits = (logits_int // w.lm_head.scale).astype(mx.float32)
     return logits
 
@@ -137,16 +132,17 @@ def init_weights(cfg: NoiseConfig, vocab_size: int, seq_len: int, d_model: int, 
     lm_head_w = q((vocab_size, d_model))
 
     # simple calibration using small random batch
-    dummy = mx.array(rng.integers(0, vocab_size, size=(4,)), dtype=mx.int32)
-    dummy_emb = tok_emb[dummy]
+    dummy_ids = mx.array(rng.integers(0, vocab_size, size=(32,)), dtype=mx.int32)
+    dummy_emb = tok_emb[dummy_ids]  # (32, d_model)
+    target = 16
     scales = {
-        "q": calibrate_linear(dummy_emb.reshape(-1, d_model), attn_q_w),
-        "k": calibrate_linear(dummy_emb.reshape(-1, d_model), attn_k_w),
-        "v": calibrate_linear(dummy_emb.reshape(-1, d_model), attn_v_w),
-        "o": calibrate_linear(dummy_emb.reshape(-1, d_head), attn_out_w),
-        "mlp_in": calibrate_linear(dummy_emb.reshape(-1, d_model), mlp_in_w),
-        "mlp_out": calibrate_linear(dummy_emb.reshape(-1, d_ff), mlp_out_w),
-        "lm": calibrate_linear(dummy_emb.reshape(-1, d_model), lm_head_w),
+        "q": calibrate_linear(dummy_emb, attn_q_w, target_max=target),
+        "k": calibrate_linear(dummy_emb, attn_k_w, target_max=target),
+        "v": calibrate_linear(dummy_emb, attn_v_w, target_max=target),
+        "o": calibrate_linear(dummy_emb.reshape(-1, d_head), attn_out_w, target_max=target),
+        "mlp_in": calibrate_linear(dummy_emb, mlp_in_w, target_max=target),
+        "mlp_out": calibrate_linear(dummy_emb.reshape(-1, d_ff), mlp_out_w, target_max=target),
+        "lm": calibrate_linear(dummy_emb, lm_head_w, target_max=target),
     }
 
     return TransformerWeights(

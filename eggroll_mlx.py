@@ -35,6 +35,11 @@ class NoiseConfig:
     use_clt: bool = True
     fast_fitness: bool = True
     fixed_point: int = 4  # 2^4 scale for int8 path
+    use_quantized_base: bool = False  # optional fast path via mlx.quantized_matmul
+    quant_bits: int = 8
+    quant_group_size: int = 32
+    update_threshold: int = 0  # optional magnitude threshold before applying sign update
+    fitness_alpha: float = 0.01  # scale factor for CLT fitness normalization
 
 
 def fold_in(base_key_int32: Tuple[int, int], new_int32: int) -> int:
@@ -120,7 +125,7 @@ def convert_fitnesses(cfg: NoiseConfig, raw_scores: mx.array) -> mx.array:
         return mx.sign(paired[:, 0] - paired[:, 1]).astype(mx.int8)
     diff = paired[:, 0] - paired[:, 1]
     rms = mx.sqrt(mx.mean(diff * diff) + 1e-8)
-    return (diff / rms).astype(mx.float32)
+    return (diff / rms * cfg.fitness_alpha).astype(mx.float32)
 
 
 def summarize(name: str, arr: mx.array) -> dict:
@@ -137,6 +142,56 @@ def summarize(name: str, arr: mx.array) -> dict:
     }
 
 
+def _stack_lora_params(
+    cfg: NoiseConfig,
+    big_rand: mx.array,
+    epoch: int,
+    thread_ids: List[int],
+    param_shape: Tuple[int, int],
+    base_seed: int,
+) -> Tuple[mx.array, mx.array]:
+    """Batch slice A/B for a list of thread_ids."""
+    A_list: List[mx.array] = []
+    B_list: List[mx.array] = []
+    for tid in thread_ids:
+        A, B = get_lora_update_params(big_rand, cfg, epoch, tid, param_shape, base_seed)
+        A_list.append(A.astype(mx.int32))
+        B_list.append(B.astype(mx.int32))
+    return mx.stack(A_list, axis=0), mx.stack(B_list, axis=0)
+
+
+def _quantized_base_mm(
+    cfg: NoiseConfig, x: mx.array, w: mx.array
+) -> Optional[mx.array]:
+    """
+    Fast base matmul using mlx.quantized_matmul (float activations, quantized weights).
+    Returns float32 output or None if unsupported for the given shapes/config.
+    """
+    # quantized_matmul needs last dim divisible by group_size
+    if w.shape[1] % cfg.quant_group_size != 0:
+        return None
+    x_float = x.astype(mx.float32) if x.dtype != mx.float32 else x
+    w_float = w.astype(mx.float32)
+    try:
+        q_weight, scales, *biases = mx.quantize(
+            w_float, cfg.quant_group_size, cfg.quant_bits, mode="affine"
+        )
+        bias = biases[0] if biases else None
+        out = mx.quantized_matmul(
+            x_float,
+            q_weight,
+            scales=scales,
+            biases=bias,
+            transpose=True,
+            group_size=cfg.quant_group_size,
+            bits=cfg.quant_bits,
+            mode="affine",
+        )
+        return out
+    except Exception:
+        return None
+
+
 def do_mm(
     cfg: NoiseConfig,
     x: mx.array,
@@ -148,18 +203,30 @@ def do_mm(
 ):
     """
     Matrix multiply with optional low-rank perturbation injected.
-    - Expects int8 inputs; uses int8 Metal kernel when available, otherwise
-      uses the custom kernel; raises if types are wrong.
-    - If epoch/thread_id is None, returns x @ w.T / sqrt(d) (no noise).
+    - Default path: int8 inputs/weights with custom Metal kernel (parity path).
+    - Optional fast path: QuantizedLinear-style base matmul (float activations, quantized weights),
+      enabled by cfg.use_quantized_base when shapes allow (group_size divides K).
+    - If epoch/thread_id is None, returns base matmul / sqrt(d) (no noise).
     - If provided, applies low-rank delta using get_lora_update_params.
     """
-    if x.dtype != mx.int8 or w.dtype != mx.int8:
-        raise ValueError("do_mm expects int8 inputs/weights; quantize first.")
+    base_out: Optional[mx.array] = None
 
-    # int-friendly matmul
-    x_int = x.astype(mx.int32)
-    w_int = w.astype(mx.int32)
-    base_out = int8_matmul(x, w)  # int32
+    if cfg.use_quantized_base:
+        base_out_float = _quantized_base_mm(cfg, x, w)
+        if base_out_float is not None:
+            base_out = mx.round(base_out_float * (2 ** cfg.fixed_point)).astype(mx.int32)
+
+    if base_out is None:
+        if x.dtype != mx.int8 or w.dtype != mx.int8:
+            raise ValueError("do_mm expects int8 inputs/weights when not using quantized base; quantize first.")
+        x_int = x.astype(mx.int32)
+        base_out = int8_matmul(x, w)  # int32
+    else:
+        # Build int representation of activations for delta path
+        if x.dtype == mx.int8:
+            x_int = x.astype(mx.int32)
+        else:
+            x_int = mx.round(x.astype(mx.float32) * (2 ** cfg.fixed_point)).astype(mx.int32)
 
     if epoch is not None and thread_id is not None and big_rand is not None and base_seed is not None:
         A, B = get_lora_update_params(big_rand, cfg, epoch, thread_id, w.shape, base_seed)
@@ -168,12 +235,62 @@ def do_mm(
         # delta = (x @ B) @ A.T with int32 ops
         proj = mx.sum(x_int[:, :, None] * B_int[None, :, :], axis=1)  # (batch, rank)
         delta = mx.sum(proj[:, :, None] * A_int[None, :, :], axis=1)  # (batch, out)
-        delta = delta >> (cfg.fixed_point + cfg.sigma_shift)
+        delta = delta >> cfg.sigma_shift
         base_out = base_out + delta
 
     denom = int(np.sqrt(w.shape[1]))
     scale = (2 ** cfg.fixed_point) * max(1, denom)
     out = base_out // scale
+    out = mx.clip(out, -127, 127)
+    return out.astype(mx.int8)
+
+
+def do_mm_batched(
+    cfg: NoiseConfig,
+    x: mx.array,
+    w: mx.array,
+    big_rand: mx.array,
+    epoch: int,
+    thread_ids: List[int],
+    base_seed: int,
+) -> mx.array:
+    """
+    Batched variant: apply per-thread low-rank deltas.
+    If x has shape (batch, k), activations are shared across pop.
+    If x has shape (pop, batch, k), activations are per-pop.
+    Returns shape (pop, batch, out_dim), int8.
+    """
+    if len(thread_ids) == 0:
+        raise ValueError("thread_ids must be non-empty for batched matmul.")
+
+    pop_dim = 1 if x.ndim == 2 else x.shape[0]
+    if x.ndim == 2:
+        batch_x = x
+        x_int = x.astype(mx.int32)
+        base_out = int8_matmul(batch_x, w)
+        base_out = mx.broadcast_to(base_out[None, :, :], (pop_dim, base_out.shape[0], base_out.shape[1]))
+        x_int = mx.broadcast_to(x_int[None, :, :], (pop_dim, x_int.shape[0], x_int.shape[1]))
+    else:
+        P, B, K = x.shape
+        batch_x = mx.reshape(x, (P * B, K))
+        base_out = int8_matmul(batch_x, w)  # (P*B, out)
+        base_out = mx.reshape(base_out, (P, B, w.shape[0]))
+        x_int = x.astype(mx.int32)
+
+    rows, cols = w.shape
+    A_stack, B_stack = _stack_lora_params(cfg, big_rand, epoch, thread_ids, (rows, cols), base_seed)
+    x_exp = x_int[:, :, :, None]  # (pop, batch, k, 1)
+    B_exp = B_stack[:, None, :, :]  # (pop, 1, k, rank)
+    proj = mx.sum(x_exp * B_exp, axis=2).astype(mx.int32)  # (pop, batch, rank)
+    proj_exp = proj[:, :, :, None]  # (pop, batch, rank, 1)
+    A_exp = A_stack[:, None, :, :]  # (pop, 1, rows, rank)
+    delta = mx.sum(proj_exp * A_exp, axis=2).astype(mx.int32)  # (pop, batch, rows)
+    delta = delta >> cfg.sigma_shift
+
+    out_int = base_out + delta
+    denom = int(np.sqrt(w.shape[1]))
+    scale = (2 ** cfg.fixed_point) * max(1, denom)
+    out = out_int // scale
     out = mx.clip(out, -127, 127)
     return out.astype(mx.int8)
 
@@ -185,10 +302,14 @@ def apply_sign_update(
     big_rand: mx.array,
     epoch: int,
     base_seed: int,
+    thread_ids: Optional[List[int]] = None,
+    seed_offset: int = 0,
 ) -> mx.array:
     """
     Apply sign update using low-rank perturbations, paired antithetic.
     fitnesses shape: (pop/2,) already paired.
+    thread_ids optionally selects which perturbation indices to use per pair (default: range(pop/2)).
+    seed_offset optionally shifts the base_seed (e.g., per-layer offset).
     """
     try:
         import jax
@@ -219,23 +340,28 @@ def apply_sign_update(
     assert param.ndim == 2, "Only matrix params handled here"
     rows, cols = param.shape
     pop_pairs = fitnesses.shape[0]
-    A_list: List[mx.array] = []
-    B_list: List[mx.array] = []
-    for idx in range(pop_pairs):
-        A, B = get_lora_update_params(big_rand, cfg, epoch, idx, (rows, cols), base_seed)
-        A_list.append(A.astype(mx.int32))
-        B_list.append(B.astype(mx.int32))
-    A_stack = mx.stack(A_list, axis=0)  # (pop/2, rows, rank)
-    B_stack = mx.stack(B_list, axis=0)  # (pop/2, cols, rank)
+    thread_ids = thread_ids or list(range(pop_pairs))
+    if len(thread_ids) != pop_pairs:
+        raise ValueError(f"thread_ids length {len(thread_ids)} must match fitnesses length {pop_pairs}")
+    A_stack, B_stack = _stack_lora_params(cfg, big_rand, epoch, thread_ids, (rows, cols), base_seed + seed_offset)
 
     if cfg.use_clt:
-        A_scaled = A_stack * fitnesses.reshape(-1, 1, 1).astype(mx.int32)
+        A_scaled = A_stack.astype(mx.float32) * fitnesses.reshape(-1, 1, 1).astype(mx.float32)
+        B_scaled = B_stack.astype(mx.float32)
     else:
-        A_scaled = mx.sign(A_stack).astype(mx.int32) * fitnesses.reshape(-1, 1, 1).astype(mx.int32)
-        B_stack = mx.sign(B_stack)
+        A_scaled = mx.sign(A_stack).astype(mx.float32) * fitnesses.reshape(-1, 1, 1).astype(mx.float32)
+        B_scaled = mx.sign(B_stack).astype(mx.float32)
 
-    Z = mx.einsum("nir,njr->ij", A_scaled.astype(mx.float32), B_stack.astype(mx.float32))
-    updated = param.astype(mx.int32) + mx.sign(Z).astype(mx.int32)
+    Z = mx.einsum("nir,njr->ij", A_scaled, B_scaled)
+    thresh = cfg.update_threshold
+    if thresh > 0:
+        # scale threshold relative to reference pop_pairs=64 to avoid over-gating small pops
+        thresh = thresh * (pop_pairs / 64.0)
+        Z_mask = mx.where(mx.abs(Z) >= thresh, mx.sign(Z), mx.zeros_like(Z))
+        delta = Z_mask.astype(mx.int32)
+    else:
+        delta = mx.sign(Z).astype(mx.int32)
+    updated = param.astype(mx.int32) + delta
     updated = mx.clip(updated, -127, 127).astype(param.dtype)
     return updated
 
@@ -285,49 +411,22 @@ if _HAS_MXFAST:
         input_names=["a", "b", "M", "N", "K"],
         output_names=["out"],
         source=r"""
-            using namespace metal;
-            // Tiled int8 matmul: a [M,K], b [N,K] (note b is row-major, we treat b rows as outputs)
-            // out = a @ b^T, shape [M,N]
-            constant int TILE = 16;  // tile size
-
-            uint3 tid = thread_position_in_threadgroup;
-            uint3 gid = thread_position_in_grid;
-
-            // Flattened element index maps to (row, col) in output
-            uint elem = gid.x;
+            uint elem = thread_position_in_grid.x;
             int Mv = int(M[0]);
             int Nv = int(N[0]);
             int Kv = int(K[0]);
             int row = int(elem / Nv);
             int col = int(elem - row * Nv);
             if (row >= Mv || col >= Nv) return;
-
-            threadgroup int8_t Atile[TILE][TILE];
-            threadgroup int8_t Btile[TILE][TILE];
-
+            int base_a = row * Kv;
+            int base_b = col * Kv;
             int32_t acc = 0;
-            int numTiles = (Kv + TILE - 1) / TILE;
-            for (int t = 0; t < numTiles; ++t) {
-                int kBase = t * TILE;
-                int aRow = row;
-                int aCol = kBase + int(tid.x);
-                int bRow = col;
-                int bCol = kBase + int(tid.y);
-
-                Atile[tid.y][tid.x] = (aCol < Kv) ? a[aRow * Kv + aCol] : int8_t(0);
-                Btile[tid.y][tid.x] = (bCol < Kv) ? b[bRow * Kv + bCol] : int8_t(0);
-                threadgroup_barrier(mem_flags::mem_threadgroup);
-
-                // Compute partial dot for this tile
-                for (int k = 0; k < TILE; ++k) {
-                    acc += int32_t(Atile[tid.y][k]) * int32_t(Btile[tid.x][k]);
-                }
-                threadgroup_barrier(mem_flags::mem_threadgroup);
+            for (int t = 0; t < Kv; ++t) {
+                acc += int32_t(a[base_a + t]) * int32_t(b[base_b + t]);
             }
             out[elem] = acc;
         """,
         ensure_row_contiguous=True,
-        threadgroup=(16, 16, 1),
     )
 
 
