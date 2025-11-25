@@ -235,9 +235,9 @@ def main():
         rewards = rewards.reshape(-1)
         fitnesses = convert_fitnesses(cfg, rewards)
 
-        weights.gru_x.weight = apply_sign_update(cfg, weights.gru_x.weight, fitnesses, ctx.big_rand, step, ctx.base_seed, thread_ids=thread_ids_for_update)
-        weights.gru_h.weight = apply_sign_update(cfg, weights.gru_h.weight, fitnesses, ctx.big_rand, step, ctx.base_seed, thread_ids=thread_ids_for_update)
-        weights.lm_head.weight = apply_sign_update(cfg, weights.lm_head.weight, fitnesses, ctx.big_rand, step, ctx.base_seed, thread_ids=thread_ids_for_update)
+        weights.gru_x.weight, _ = apply_sign_update(cfg, weights.gru_x.weight, fitnesses, ctx.big_rand, step, ctx.base_seed, thread_ids=thread_ids_for_update)
+        weights.gru_h.weight, _ = apply_sign_update(cfg, weights.gru_h.weight, fitnesses, ctx.big_rand, step, ctx.base_seed, thread_ids=thread_ids_for_update)
+        weights.lm_head.weight, _ = apply_sign_update(cfg, weights.lm_head.weight, fitnesses, ctx.big_rand, step, ctx.base_seed, thread_ids=thread_ids_for_update)
 
         logits_eval = forward_gru_int8(ctx, weights, x, thread_id=None)
         loss = cross_entropy(logits_eval, y)

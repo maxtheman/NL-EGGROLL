@@ -32,7 +32,7 @@ class NoiseConfig:
     rank: int = 1
     sigma_shift: int = 4  # matches nano-egg default
     noise_reuse: int = 1
-    use_clt: bool = True
+    use_clt: bool = True  # matches nano-egg default
     fast_fitness: bool = True
     fixed_point: int = 4  # 2^4 scale for int8 path
     use_quantized_base: bool = False  # optional fast path via mlx.quantized_matmul
@@ -40,34 +40,55 @@ class NoiseConfig:
     quant_group_size: int = 32
     update_threshold: int = 0  # optional magnitude threshold before applying sign update
     fitness_alpha: float = 0.01  # scale factor for CLT fitness normalization
+    debug_perturbations: bool = False  # print noise stats (WARNING: significantly slows down training due to CPU sync)
 
 
-def fold_in(base_key_int32: Tuple[int, int], new_int32: int) -> int:
+def fold_in(base_key_int32: Tuple[int, int], new_int32: int | mx.array) -> int | mx.array:
     """
     Matches the fold_in logic in nano-egg (see run.py:424-439).
     base_key_int32 is a tuple/list of two uint32 ints (jax key data style).
+    Supports both scalar int and mx.array for new_int32.
     """
     x = new_int32
-    x = ((x >> 16) ^ x) * 0x45D9F3B
-    return base_key_int32[0] ^ x
+    if isinstance(x, mx.array):
+        # Vectorized path
+        x = ((x >> 16) ^ x) * 0x45D9F3B
+        # base_key_int32[0] is scalar, x is array
+        return mx.array(base_key_int32[0], dtype=x.dtype) ^ x
+    else:
+        # Scalar path
+        x = ((x >> 16) ^ x) * 0x45D9F3B
+        return base_key_int32[0] ^ x
 
 
-def get_common_start_idx(cfg: NoiseConfig, epoch: int, thread_id: int, base_seed: int) -> Tuple[int, int]:
+def get_common_start_idx(
+    cfg: NoiseConfig, epoch: int, thread_id: int | mx.array, base_seed: int
+) -> Tuple[int | mx.array, int | mx.array]:
     """
     Compute start index into BIG_RAND and antithetic sign.
     Mirrors nano-egg get_common_start_idx.
+    Supports vectorized thread_id (mx.array).
     """
-    try:
-        import run as nano  # type: ignore
-        import jax
-
-        dummy_param = jax.numpy.zeros((2, 2))
-        start_idx, sign = nano.get_common_start_idx(
-            {"noise_reuse": cfg.noise_reuse}, (epoch, thread_id), dummy_param, jax.random.key(int(base_seed))
-        )
-        return int(start_idx), int(sign)
-    except Exception:
-        true_epoch = 0 if cfg.noise_reuse == 0 else epoch // cfg.noise_reuse
+    # Note: We skip the jax/nano import check for the vectorized path to keep it simple
+    # and because we are optimizing for MLX speed.
+    
+    true_epoch = 0 if cfg.noise_reuse == 0 else epoch // cfg.noise_reuse
+    
+    if isinstance(thread_id, mx.array):
+        true_thread_idx = (thread_id >> 1)
+        # fold_in handles array broadcasting
+        actual_key = fold_in((int(base_seed), 0), true_thread_idx + true_epoch)
+        start_idx = actual_key & (2**30 - 1)
+        # Vectorized sign: 1 if even, -1 if odd
+        # (thread_id % 2) is 0 or 1. 
+        # 1 - 2*(thread_id % 2) -> 1 if 0, -1 if 1.
+        # Wait, nano-egg: sign = 1 if (thread_id % 2 == 0) else -1
+        # If thread_id % 2 == 0 -> 1
+        # If thread_id % 2 == 1 -> -1
+        # Formula: 1 - 2 * (thread_id % 2)
+        sign = 1 - 2 * (thread_id % 2)
+        return start_idx, sign
+    else:
         true_thread_idx = (thread_id >> 1)
         actual_key = fold_in((int(base_seed), 0), true_thread_idx + true_epoch)
         start_idx = actual_key & (2**30 - 1)
@@ -79,23 +100,47 @@ def get_lora_update_params(
     big_rand: mx.array,
     cfg: NoiseConfig,
     epoch: int,
-    thread_id: int,
+    thread_id: int | mx.array | List[int],
     param_shape: Tuple[int, int],
     base_seed: int,
 ) -> Tuple[mx.array, mx.array]:
     """
     Slice BIG_RAND into A (rows x rank) and B (cols x rank).
     Order matches nano-egg: first B (cols), then A (rows).
+    Supports vectorized thread_id (mx.array or list).
     """
     rows, cols = param_shape
     r = cfg.rank
     span = (rows + cols) * r
+    
+    # Handle list input
+    if isinstance(thread_id, list):
+        thread_id = mx.array(thread_id, dtype=mx.int32)
+        
     start_idx, anti_sign = get_common_start_idx(cfg, epoch, thread_id, base_seed)
-    start_idx = int(start_idx) % max(1, int(big_rand.shape[0] - span))
-    slice_ = mx.reshape(big_rand[start_idx : start_idx + span], (rows + cols, r))
-    B = slice_[:cols]
-    A = slice_[cols:]
-    return A * anti_sign, B
+    
+    limit = max(1, int(big_rand.shape[0] - span))
+    
+    if isinstance(start_idx, mx.array):
+        # Vectorized path
+        start_idx = start_idx % limit
+        # Gather: (pop, span)
+        indices = start_idx[:, None] + mx.arange(span)[None, :]
+        slice_ = big_rand[indices]
+        slice_ = mx.reshape(slice_, (start_idx.shape[0], rows + cols, r))
+        
+        B = slice_[:, :cols]
+        A = slice_[:, cols:]
+        
+        # Apply sign (pop, 1, 1) broadcast
+        return A * anti_sign[:, None, None], B
+    else:
+        # Scalar path
+        start_idx = int(start_idx) % limit
+        slice_ = mx.reshape(big_rand[start_idx : start_idx + span], (rows + cols, r))
+        B = slice_[:cols]
+        A = slice_[cols:]
+        return A * anti_sign, B
 
 
 def get_nonlora_update_params(
@@ -146,18 +191,13 @@ def _stack_lora_params(
     cfg: NoiseConfig,
     big_rand: mx.array,
     epoch: int,
-    thread_ids: List[int],
+    thread_ids: List[int] | mx.array,
     param_shape: Tuple[int, int],
     base_seed: int,
 ) -> Tuple[mx.array, mx.array]:
     """Batch slice A/B for a list of thread_ids."""
-    A_list: List[mx.array] = []
-    B_list: List[mx.array] = []
-    for tid in thread_ids:
-        A, B = get_lora_update_params(big_rand, cfg, epoch, tid, param_shape, base_seed)
-        A_list.append(A.astype(mx.int32))
-        B_list.append(B.astype(mx.int32))
-    return mx.stack(A_list, axis=0), mx.stack(B_list, axis=0)
+    # Now fully vectorized via get_lora_update_params
+    return get_lora_update_params(big_rand, cfg, epoch, thread_ids, param_shape, base_seed)
 
 
 def _quantized_base_mm(
@@ -238,7 +278,7 @@ def do_mm(
         delta = delta >> cfg.sigma_shift
         base_out = base_out + delta
 
-    denom = int(np.sqrt(w.shape[1]))
+    denom = w.shape[1]
     scale = (2 ** cfg.fixed_point) * max(1, denom)
     out = base_out // scale
     out = mx.clip(out, -127, 127)
@@ -263,7 +303,7 @@ def do_mm_batched(
     if len(thread_ids) == 0:
         raise ValueError("thread_ids must be non-empty for batched matmul.")
 
-    pop_dim = 1 if x.ndim == 2 else x.shape[0]
+    pop_dim = len(thread_ids) if x.ndim == 2 else x.shape[0]
     if x.ndim == 2:
         batch_x = x
         x_int = x.astype(mx.int32)
@@ -287,8 +327,12 @@ def do_mm_batched(
     delta = mx.sum(proj_exp * A_exp, axis=2).astype(mx.int32)  # (pop, batch, rows)
     delta = delta >> cfg.sigma_shift
 
+    if cfg.debug_perturbations:
+        d_float = delta.astype(mx.float32)
+        print(f"DEBUG: do_mm_batched noise: mean={d_float.mean().item():.4f}, std={d_float.std().item():.4f}, max={d_float.max().item():.4f}, min={d_float.min().item():.4f}")
+
     out_int = base_out + delta
-    denom = int(np.sqrt(w.shape[1]))
+    denom = w.shape[1]
     scale = (2 ** cfg.fixed_point) * max(1, denom)
     out = out_int // scale
     out = mx.clip(out, -127, 127)
@@ -304,39 +348,18 @@ def apply_sign_update(
     base_seed: int,
     thread_ids: Optional[List[int]] = None,
     seed_offset: int = 0,
-) -> mx.array:
+) -> Tuple[mx.array, int]:
     """
     Apply sign update using low-rank perturbations, paired antithetic.
-    fitnesses shape: (pop/2,) already paired.
-    thread_ids optionally selects which perturbation indices to use per pair (default: range(pop/2)).
-    seed_offset optionally shifts the base_seed (e.g., per-layer offset).
+    Returns (updated_param, num_changed_params).
     """
-    try:
-        import jax
-        import jax.numpy as jnp
-        import run as nano  # type: ignore
-
-        p_jax = jnp.array(np.array(param))
-        f_jax = jnp.array(np.array(fitnesses))
-        nr = {
-            "noise_reuse": cfg.noise_reuse,
-            "rank": cfg.rank,
-            "use_clt": cfg.use_clt,
-            "fast_fitness": cfg.fast_fitness,
-        }
-        np_params = {
-            "BIG_RAND_MATRIX": jnp.array(np.array(big_rand)),
-            "sigma_shift": cfg.sigma_shift,
-            "update_threshold": 0,
-        }
-        iterinfos = (
-            jnp.full(fitnesses.shape[0], epoch, dtype=jnp.int32),
-            jnp.arange(fitnesses.shape[0], dtype=jnp.int32),
-        )
-        updated = nano.QEggRoll._do_update(nr, np_params, p_jax, jax.random.key(int(base_seed)), f_jax, iterinfos, 1)
-        return mx.array(np.array(updated), dtype=param.dtype)
-    except Exception:
-        pass
+    # try:
+    #     import jax
+    #     import jax.numpy as jnp
+    #     import run as nano  # type: ignore
+    #     ...
+    # except Exception:
+    #     pass
     assert param.ndim == 2, "Only matrix params handled here"
     rows, cols = param.shape
     pop_pairs = fitnesses.shape[0]
@@ -353,17 +376,31 @@ def apply_sign_update(
         B_scaled = mx.sign(B_stack).astype(mx.float32)
 
     Z = mx.einsum("nir,njr->ij", A_scaled, B_scaled)
+    Z = mx.einsum("nir,njr->ij", A_scaled, B_scaled)
     thresh = cfg.update_threshold
     if thresh > 0:
-        # scale threshold relative to reference pop_pairs=64 to avoid over-gating small pops
-        thresh = thresh * (pop_pairs / 64.0)
-        Z_mask = mx.where(mx.abs(Z) >= thresh, mx.sign(Z), mx.zeros_like(Z))
+        # Reference logic:
+        # abs(Z) * 2^FP < thresh * sqrt(pop) * (4^FP if clt else 1)
+        # So: abs(Z) < thresh * sqrt(pop) * (2^FP if clt else 2^-FP)
+        
+        scale_factor = np.sqrt(pop_pairs)
+        if cfg.use_clt:
+            # thresh * sqrt(pop) * 4^FP / 2^FP = thresh * sqrt(pop) * 2^FP
+            scale_factor *= (2 ** cfg.fixed_point)
+        else:
+            # thresh * sqrt(pop) / 2^FP
+            scale_factor /= (2 ** cfg.fixed_point)
+            
+        thresh_val = thresh * scale_factor
+        Z_mask = mx.where(mx.abs(Z) >= thresh_val, mx.sign(Z), mx.zeros_like(Z))
         delta = Z_mask.astype(mx.int32)
     else:
         delta = mx.sign(Z).astype(mx.int32)
     updated = param.astype(mx.int32) + delta
     updated = mx.clip(updated, -127, 127).astype(param.dtype)
-    return updated
+    
+    num_changed = int(mx.sum(mx.abs(delta)).item())
+    return updated, num_changed
 
 
 def apply_full_update(
@@ -439,11 +476,37 @@ def int8_matmul(a: mx.array, b: mx.array) -> mx.array:
     n = b.shape[0]
     if _int8_mm_kernel is None:
         raise RuntimeError("int8 matmul kernel missing; mlx.fast must be available.")
+    # Check for grid size overflow (signed 32-bit limit)
+    total_elements = m * n
+    MAX_GRID = 2**31 - 65536  # Safety margin
+    
+    if total_elements > MAX_GRID:
+        # Split along m dimension
+        chunk_size_m = MAX_GRID // n
+        num_chunks = (m + chunk_size_m - 1) // chunk_size_m
+        outputs = []
+        for i in range(num_chunks):
+            start = i * chunk_size_m
+            end = min(start + chunk_size_m, m)
+            a_chunk = a[start:end]
+            m_chunk = end - start
+            
+            out_chunk_flat = _int8_mm_kernel(
+                inputs=[a_chunk, b, mx.array([m_chunk], dtype=mx.int32), mx.array([n], dtype=mx.int32), mx.array([k], dtype=mx.int32)],
+                output_shapes=[(int(m_chunk * n),)],
+                output_dtypes=[mx.int32],
+                grid=(int(m_chunk * n), 1, 1),
+                threadgroup=(256, 1, 1),
+            )[0]
+            outputs.append(mx.reshape(out_chunk_flat, (m_chunk, n)))
+        return mx.concatenate(outputs, axis=0)
+
+    # Standard path
     out_flat = _int8_mm_kernel(
         inputs=[a, b, mx.array([m], dtype=mx.int32), mx.array([n], dtype=mx.int32), mx.array([k], dtype=mx.int32)],
-        output_shapes=[(m * n,)],
+        output_shapes=[(int(m * n),)],
         output_dtypes=[mx.int32],
-        grid=(m * n, 1, 1),
+        grid=(int(m * n), 1, 1),
         threadgroup=(256, 1, 1),
     )[0]
     return mx.reshape(out_flat, (m, n))
