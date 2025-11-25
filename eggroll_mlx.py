@@ -285,22 +285,49 @@ if _HAS_MXFAST:
         input_names=["a", "b", "M", "N", "K"],
         output_names=["out"],
         source=r"""
-            uint elem = thread_position_in_grid.x;
+            using namespace metal;
+            // Tiled int8 matmul: a [M,K], b [N,K] (note b is row-major, we treat b rows as outputs)
+            // out = a @ b^T, shape [M,N]
+            constant int TILE = 16;  // tile size
+
+            uint3 tid = thread_position_in_threadgroup;
+            uint3 gid = thread_position_in_grid;
+
+            // Flattened element index maps to (row, col) in output
+            uint elem = gid.x;
             int Mv = int(M[0]);
             int Nv = int(N[0]);
             int Kv = int(K[0]);
             int row = int(elem / Nv);
             int col = int(elem - row * Nv);
             if (row >= Mv || col >= Nv) return;
-            int base_a = row * Kv;
-            int base_b = col * Kv;
+
+            threadgroup int8_t Atile[TILE][TILE];
+            threadgroup int8_t Btile[TILE][TILE];
+
             int32_t acc = 0;
-            for (int t = 0; t < Kv; ++t) {
-                acc += int32_t(a[base_a + t]) * int32_t(b[base_b + t]);
+            int numTiles = (Kv + TILE - 1) / TILE;
+            for (int t = 0; t < numTiles; ++t) {
+                int kBase = t * TILE;
+                int aRow = row;
+                int aCol = kBase + int(tid.x);
+                int bRow = col;
+                int bCol = kBase + int(tid.y);
+
+                Atile[tid.y][tid.x] = (aCol < Kv) ? a[aRow * Kv + aCol] : int8_t(0);
+                Btile[tid.y][tid.x] = (bCol < Kv) ? b[bRow * Kv + bCol] : int8_t(0);
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+
+                // Compute partial dot for this tile
+                for (int k = 0; k < TILE; ++k) {
+                    acc += int32_t(Atile[tid.y][k]) * int32_t(Btile[tid.x][k]);
+                }
+                threadgroup_barrier(mem_flags::mem_threadgroup);
             }
             out[elem] = acc;
         """,
         ensure_row_contiguous=True,
+        threadgroup=(16, 16, 1),
     )
 
 
