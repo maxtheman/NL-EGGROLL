@@ -461,7 +461,19 @@ if _HAS_MXFAST:
             int base_a = row * Kv;
             int base_b = col * Kv;
             int32_t acc = 0;
-            for (int t = 0; t < Kv; ++t) {
+            int kv4 = Kv >> 2;
+            const device char4* a4 = reinterpret_cast<const device char4*>(a + base_a);
+            const device char4* b4 = reinterpret_cast<const device char4*>(b + base_b);
+            for (int i = 0; i < kv4; ++i) {
+                char4 va = a4[i];
+                char4 vb = b4[i];
+                acc += int32_t(va.x) * int32_t(vb.x);
+                acc += int32_t(va.y) * int32_t(vb.y);
+                acc += int32_t(va.z) * int32_t(vb.z);
+                acc += int32_t(va.w) * int32_t(vb.w);
+            }
+            int tail = kv4 << 2;
+            for (int t = tail; t < Kv; ++t) {
                 acc += int32_t(a[base_a + t]) * int32_t(b[base_b + t]);
             }
             out[elem] = acc;
@@ -480,30 +492,6 @@ def int8_matmul(a: mx.array, b: mx.array) -> mx.array:
     if _int8_mm_kernel is None:
         raise RuntimeError("int8 matmul kernel missing; mlx.fast must be available.")
     # Check for grid size overflow (signed 32-bit limit)
-    total_elements = m * n
-    MAX_GRID = 2**31 - 65536  # Safety margin
-    
-    if total_elements > MAX_GRID:
-        # Split along m dimension
-        chunk_size_m = MAX_GRID // n
-        num_chunks = (m + chunk_size_m - 1) // chunk_size_m
-        outputs = []
-        for i in range(num_chunks):
-            start = i * chunk_size_m
-            end = min(start + chunk_size_m, m)
-            a_chunk = a[start:end]
-            m_chunk = end - start
-            
-            out_chunk_flat = _int8_mm_kernel(
-                inputs=[a_chunk, b, mx.array([m_chunk], dtype=mx.int32), mx.array([n], dtype=mx.int32), mx.array([k], dtype=mx.int32)],
-                output_shapes=[(int(m_chunk * n),)],
-                output_dtypes=[mx.int32],
-                grid=(int(m_chunk * n), 1, 1),
-                threadgroup=(256, 1, 1),
-            )[0]
-            outputs.append(mx.reshape(out_chunk_flat, (m_chunk, n)))
-        return mx.concatenate(outputs, axis=0)
-
     # Standard path
     out_flat = _int8_mm_kernel(
         inputs=[a, b, mx.array([m], dtype=mx.int32), mx.array([n], dtype=mx.int32), mx.array([k], dtype=mx.int32)],
