@@ -1,13 +1,21 @@
 # NL-EGGROLL
 
-Unofficial MLX/Metal exploration of the EGGROLL paper (“Evolution Guided General Optimization via Low-rank Learning”) using low-rank ES updates for int8-heavy RNN/GRU language models. This repo mirrors core ideas from the paper but adapts kernels and scaling to Apple Silicon; those changes appear to reduce numerical stability, and I have not been able to reproduce the headline results.
+Minimal MLX/Metal exploration of the EGGROLL paper (“Evolution Guided General Optimization via Low-rank Learning”). This fork focuses on a few runnable scripts only. Because MLX on Metal lacks an int8 activation + int32 accumulate path, the current implementation forces fp16 activations/weights in the critical matmuls. That deviation likely reduces numerical stability, and I have not been able to reproduce the paper’s int8 results.
 
-## Current status
-- Training runs on M-series hardware with int8 weights/activations, but convergence is fragile and often stalls.
-- Metal/MLX lacks an int8 activation + int32 accumulate path (no NAX integer fragments), forcing implementation differences from the reference that likely hurt stability.
-- Threshold logic fixed to match the reference; large populations and higher rank improve signal, but reproducible wins remain elusive.
+## Installation (uv)
+```bash
+# Create and enter a virtual environment
+uv venv .venv
+source .venv/bin/activate
 
-## Quick start (what’s been working best)
+# Install dependencies (MLX requires macOS + Apple Silicon)
+uv pip install mlx optuna numpy
+```
+
+## Run instructions (reproductions)
+
+### 1) ES trainer (fp16) on TinyStories-count
+Uses low-rank ES with fp16 matmuls (no int8 path on MLX).
 ```bash
 PYTHONPATH=. uv run python scripts/train_tinystories_gru_full.py \
   --data_dir data/count \
@@ -29,23 +37,54 @@ PYTHONPATH=. uv run python scripts/train_tinystories_gru_full.py \
   --sigma_shift 4 \
   --checkpoint ckpts/count.ckpt
 ```
-Note: even with these settings, loss curves can bounce and sometimes fail to improve.
+Status: runs end-to-end on M-series, but loss can stagnate; fp16 path differs from the paper’s int8 reference.
 
-## Key observations
-- **Population size & rank:** Rank=1 rarely converges; rank 4–16 with pop ≥2k gives a cleaner signal but still noisy.
-- **Threshold scaling:** Must scale by √pop and fixed_point; high thresholds (e.g., 512) effectively freeze updates.
-- **Performance:** Forward scales linearly with population; group_size too small underutilizes the GPU, too large blows memory (cross-entropy broadcast).
-- **Matmul kernels:** int8 `quantized_matmul` on Metal dequantizes to float; the large vocab head is slower in int8 than fp16, making fp16 generally faster overall.
-- **NAX:** Current MLX builds expose NAX only for float/bfloat; no integer NAX path, so true int8 activation pipelines aren’t available.
+### 2) Baseline GRU with AdamW (count task)
+Backprop baseline matching model geometry; requires count data.
+```bash
+# Generate toy count data (writes to data/count)
+PYTHONPATH=. uv run python scripts/make_count_data.py --out_dir data/count
+
+# Train baseline
+PYTHONPATH=. uv run python scripts/train_count_gru_adamw.py \
+  --data_dir data/count \
+  --vocab_size 16 \
+  --seq_len 32 \
+  --d_model 64 \
+  --d_hidden 64 \
+  --layers 1 \
+  --batch_size 64 \
+  --steps 500 \
+  --lr 1e-3
+```
+
+### 3) Hyperparameter tuning with Optuna (ES)
+Lightweight sweep over a few ES hyperparameters on the count task.
+```bash
+PYTHONPATH=. uv run python scripts/tune_eggroll_optuna.py \
+  --data_dir data/count \
+  --vocab_size 16 \
+  --seq_len 32 \
+  --d_model 64 \
+  --d_hidden 64 \
+  --layers 1 \
+  --batch_size 64 \
+  --steps 100 \
+  --pop_size 256 \
+  --fixed_point 4 \
+  --noise_reuse 1 \
+  --weight_clip 3.0
+```
 
 ## What’s inside
-- `eggroll_mlx.py`: Metal/MLX implementation of low-rank ES matmuls and noise.
-- `scripts/train_tinystories_gru_full.py`: GRU language model trainer adapted to EGGROLL-style updates.
-- `findings/`: Benchmarks, scale sweeps, and debugging notes (see `findings.md` for a narrative).
-- `EGGROLL.pdf`: Paper for the original method.
+- `eggroll_mlx.py`: MLX implementation of low-rank ES primitives.
+- `eggroll_api.py`: Convenience wrapper for noise/context handling.
+- `scripts/train_tinystories_gru_full.py`: ES trainer (fp16 path on MLX).
+- `scripts/train_count_gru_adamw.py`: AdamW baseline for the count task.
+- `scripts/tune_eggroll_optuna.py`: Small Optuna tuner for ES hyperparams.
+- `scripts/train_tinystories_gru_int8.py`: Support code used by the ES trainer (still executes with fp16 matmuls under MLX).
 
-## Open issues / future work
-- Explore alternative fitness scaling (raw rewards vs sign) for stability.
-- Try mixed-precision accumulators or higher-rank noise to mitigate Metal quantization quirks.
-- Revisit custom Metal kernels once integer NAX fragments exist or a custom metallib can be built.
-
+## Current status and caveats
+- MLX/Metal has no int8 activation + int32 accumulate kernel; `mlx.quantized_matmul` dequantizes to float, so this code runs fp16 and cannot match the paper’s int8 path.
+- Large populations and higher rank help signal quality, but convergence remains fragile on M-series.
+- Memory can spike with large group sizes; adjust `group_size` if you hit OOM.
