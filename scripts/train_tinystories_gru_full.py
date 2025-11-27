@@ -39,9 +39,10 @@ def cross_entropy(logits, targets, reduction='mean'):
     # Gather-based implementation to avoid one-hot allocation
     if targets.ndim < logits.ndim - 1:
         targets = mx.broadcast_to(targets, logits.shape[:-1])
-    max_logits = mx.max(logits, axis=-1, keepdims=True)
-    logsumexp = max_logits + mx.log(mx.sum(mx.exp(logits - max_logits), axis=-1, keepdims=True))
-    target_logits = mx.take_along_axis(logits, targets[..., None], axis=-1)[..., 0]
+    logits_f = logits.astype(mx.float32)
+    max_logits = mx.max(logits_f, axis=-1, keepdims=True)
+    logsumexp = max_logits + mx.log(mx.sum(mx.exp(logits_f - max_logits), axis=-1, keepdims=True))
+    target_logits = mx.take_along_axis(logits_f, targets[..., None], axis=-1)[..., 0]
     loss = logsumexp[..., 0] - target_logits
     if reduction == 'mean':
         return mx.mean(loss)
@@ -137,6 +138,9 @@ def pack_int8_to_uint32(w_float: mx.array):
     return w_float, None, None
 
 def save_checkpoint(weights: ModelWeights, path: str):
+    # Ensure .safetensors suffix
+    if not path.endswith(".safetensors"):
+        path = path + ".safetensors"
     print(f"Saving checkpoint to {path}...")
     tensors = {}
     
@@ -179,8 +183,15 @@ def save_checkpoint(weights: ModelWeights, path: str):
     print("Checkpoint saved.")
 
 def load_checkpoint(path: str, cfg: NoiseConfig, vocab: int, seq_len: int, d_model: int, d_hidden: int, n_layers: int) -> ModelWeights:
-    print(f"Loading checkpoint from {path}...")
-    tensors = mx.load_safetensors(path)
+    # Try raw path, then .safetensors
+    if Path(path).exists():
+        ckpt_path = Path(path)
+    elif Path(path + ".safetensors").exists():
+        ckpt_path = Path(path + ".safetensors")
+    else:
+        raise FileNotFoundError(f"Checkpoint {path} not found")
+    print(f"Loading checkpoint from {ckpt_path}...")
+    tensors = mx.load(str(ckpt_path))
     
     tok_emb = tensors["tok_emb"]
     pos_emb = tensors["pos_emb"]
@@ -381,8 +392,9 @@ def forward_model(
     ctx: EggrollContext,
     w: ModelWeights,
     x_tokens: mx.array,
-    thread_ids: List[int] | mx.array,
+    thread_ids: Optional[List[int] | mx.array],
     h_states: Optional[mx.array] = None,
+    return_seq_logits: bool = False,
 ) -> Tuple[mx.array, mx.array]:
     # Vectorized over population dimension.
     # x_tokens: (B,S), thread_ids: (P,), h_states: (P, B, H) or None.
@@ -391,7 +403,7 @@ def forward_model(
     # Pre-gather noise if thread_ids is list (population mode)
     block_noises = []
     head_noise = None
-    if isinstance(thread_ids, list) or (isinstance(thread_ids, mx.array) and thread_ids.ndim == 1):
+    if thread_ids is not None and (isinstance(thread_ids, list) or (isinstance(thread_ids, mx.array) and thread_ids.ndim == 1)):
         tids = list(thread_ids) if isinstance(thread_ids, mx.array) else thread_ids
         for blk_idx, blk in enumerate(w.blocks):
             base = blk_idx * 100
@@ -421,11 +433,13 @@ def forward_model(
         else:
             states_list = [h_states[i] for i in range(num_layers)]
 
+    logits_seq: List[mx.array] = []
+
     for t in range(S):
         x_shared = x_emb[:, t, :]  # (B,D)
         x_t = mx.broadcast_to(x_shared[None, ...], (P, B, x_shared.shape[-1]))  # (P,B,D)
         for blk_idx, blk in enumerate(w.blocks):
-            tid_base = [tid + blk_idx * 10 for tid in thread_ids] if isinstance(thread_ids, list) else (thread_ids + blk_idx * 10 if isinstance(thread_ids, mx.array) else thread_ids)
+            tid_base = None if thread_ids is None else ([tid + blk_idx * 10 for tid in thread_ids] if isinstance(thread_ids, list) else (thread_ids + blk_idx * 10 if isinstance(thread_ids, mx.array) else thread_ids))
             h_state = states_list[blk_idx]
 
             # Use pre-gathered noise if available
@@ -433,14 +447,44 @@ def forward_model(
             h_new = forward_block(ctx, blk, x_t, h_state, tid_base, seed_offset=blk_idx * 100, noise=noise)
             states_list[blk_idx] = h_new
             x_t = h_new
-        
+
+        if return_seq_logits:
+            last_ln_t = mx.fast.layer_norm(x_t, w.ln_out_scale, w.ln_out_bias, eps=1e-5)
+            logits_t = matmul_with_noise(ctx, w.head, last_ln_t, thread_ids, seed_offset=0, noise=head_noise if thread_ids is not None else None)
+            if w.head_bias is not None:
+                logits_t = logits_t + w.head_bias
+            logits_seq.append(logits_t.astype(mx.float32))
+    
     # Head
     last_ln = mx.fast.layer_norm(x_t, w.ln_out_scale, w.ln_out_bias, eps=1e-5)
-    logits = matmul_with_noise(ctx, w.head, last_ln, thread_ids, seed_offset=0, noise=head_noise)
+    logits = matmul_with_noise(ctx, w.head, last_ln, thread_ids, seed_offset=0, noise=head_noise if thread_ids is not None else None)
     if w.head_bias is not None:
         logits = logits + w.head_bias
 
+    if return_seq_logits and logits_seq:
+        logits_all = mx.stack(logits_seq, axis=0)  # (S, P, B, V)
+        logits_all = mx.transpose(logits_all, (1, 2, 0, 3))  # (P, B, S, V)
+        return logits_all.astype(mx.float32), mx.stack(states_list, axis=0)
+
     return logits.astype(mx.float32), mx.stack(states_list, axis=0)
+
+
+def generate(ctx: EggrollContext, w: ModelWeights, input_ids: list[int], max_new_tokens: int = 50) -> list[int]:
+    """Greedy numeric-token generator."""
+    seq = list(input_ids)
+    max_len = w.pos_emb.shape[0]
+    for _ in range(max_new_tokens):
+        # Use only the last max_len tokens for positional embeddings
+        tail = seq[-max_len:]
+        x_tokens = mx.array(tail, dtype=mx.int32)[None, :]  # (1, S)
+        # Run forward fresh each step (teacher-forced style) to avoid state drift
+        logits, _ = forward_model(ctx, w, x_tokens, thread_ids=None, h_states=None)
+        last_logits = logits[0, -1]  # (vocab,)
+        next_id = int(mx.argmax(last_logits).item())
+        seq.append(next_id)
+    return seq
+
+
 
 
 def main():
@@ -455,10 +499,12 @@ def main():
     ap.add_argument("--pop_size", type=int, default=8)
     ap.add_argument("--batch_size", type=int, default=32)
     ap.add_argument("--steps", type=int, default=50)
+    ap.add_argument("--rank", type=int, default=4, help="rank of low-rank perturbations")
+    ap.add_argument("--use_clt", type=int, default=1, help="use CLT-based updates (1) or sign-based (0)")
     ap.add_argument("--fixed_point", type=int, default=4)
-    ap.add_argument("--sigma_shift", type=int, default=4)
+    ap.add_argument("--sigma_shift", type=int, default=0)
     ap.add_argument("--init_scale", type=float, default=16.0)
-    ap.add_argument("--fast_fitness", type=int, default=1)
+    ap.add_argument("--fast_fitness", type=int, default=0)
     ap.add_argument("--fitness_alpha", type=float, default=0.01, help="scale factor for CLT fitness normalization")
     ap.add_argument("--update_threshold", type=int, default=32, help="initial update threshold; set >0 to gate small votes")
     ap.add_argument("--update_threshold_final", type=int, default=None, help="optional final threshold for linear decay")
@@ -466,13 +512,15 @@ def main():
     ap.add_argument("--noise_reuse", type=int, default=1, help="reuse noise every N epochs (matches reference get_common_start_idx)")
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--carry_state", action="store_true", help="carry pop hidden state across batches")
+    ap.add_argument("--checkpoint", type=str, default=None, help="path to load if exists and save on exit")
     ap.add_argument("--save_checkpoint", type=str, default=None, help="path to save checkpoint")
     ap.add_argument("--load_checkpoint", type=str, default=None, help="path to load checkpoint")
     ap.add_argument("--prompt", type=str, default=None, help="prompt for generation (skips training if set)")
     ap.add_argument("--save_every", type=int, default=100, help="save checkpoint every N steps")
     ap.add_argument("--debug_perturbations", action="store_true", help="enable verbose logging of perturbation stats")
     ap.add_argument("--learning_rate", type=float, default=0.01, help="step size multiplier for sign updates")
-    ap.add_argument("--weight_clip", type=float, default=5.0, help="clip weights to [-C, C] after update")
+    ap.add_argument("--weight_clip", type=float, default=3.0, help="clip weights to [-C, C] after update")
+    ap.add_argument("--learning_rate_final", type=float, default=None, help="optional final lr for linear decay (defaults to learning_rate)")
     args = ap.parse_args()
 
     if args.pop_size % 2 != 0:
@@ -481,18 +529,24 @@ def main():
     if args.group_size is None:
         args.group_size = args.pop_size
 
-    print("DEBUG: Loading tokens...")
-    rng = np.random.default_rng(args.seed)
-    train_path = Path(args.data_dir) / "train_tokens.npy"
-    if not train_path.exists():
-        train_path = Path(args.data_dir) / "train_tokens.uint16.memmap"
-    memmap = load_tokens(train_path)
-    print(f"DEBUG: Loaded tokens from {train_path}, shape={memmap.shape}")
+    checkpoint_path = args.checkpoint or args.load_checkpoint
+    save_path = args.checkpoint or args.save_checkpoint
 
+    rng = np.random.default_rng(args.seed)
+
+    memmap = None
+    if not args.prompt:
+        print("DEBUG: Loading tokens...")
+        train_path = Path(args.data_dir) / "train_tokens.npy"
+        if not train_path.exists():
+            train_path = Path(args.data_dir) / "train_tokens.uint16.memmap"
+        memmap = load_tokens(train_path)
+        print(f"DEBUG: Loaded tokens from {train_path}, shape={memmap.shape}")
+    
     cfg = NoiseConfig(
         fixed_point=args.fixed_point,
         sigma_shift=args.sigma_shift,
-        rank=1,
+        rank=args.rank,
         fast_fitness=bool(args.fast_fitness),
         fitness_alpha=args.fitness_alpha,
         update_threshold=args.update_threshold,
@@ -500,16 +554,21 @@ def main():
         debug_perturbations=args.debug_perturbations,
         learning_rate=args.learning_rate,
         weight_clip=args.weight_clip,
+        use_clt=bool(args.use_clt),
     )
+    lr_start = args.learning_rate
+    lr_end = args.learning_rate if args.learning_rate_final is None else args.learning_rate_final
     param_span = (args.d_model + 3 * args.d_hidden + 4 * args.d_hidden + args.vocab_size) * cfg.rank * args.pop_size * 2
     print(f"DEBUG: Creating context with param_span={param_span}...")
     ctx = make_context(cfg, param_span=param_span, seed=args.seed, safety_margin=4096)
     print(f"DEBUG: Context created. big_rand stats: mean={mx.mean(ctx.big_rand.astype(mx.float32)).item():.4f}, max={mx.max(ctx.big_rand).item()}, min={mx.min(ctx.big_rand).item()}, nonzeros={mx.sum(ctx.big_rand != 0).item()}")
     
-    if args.load_checkpoint:
-        print(f"Loading checkpoint from {args.load_checkpoint}...")
-        weights = load_checkpoint(args.load_checkpoint, cfg, args.vocab_size, args.seq_len, args.d_model, args.d_hidden, args.layers)
+    if checkpoint_path and (Path(checkpoint_path).exists() or Path(checkpoint_path + ".safetensors").exists()):
+        print(f"Loading checkpoint from {checkpoint_path}...")
+        weights = load_checkpoint(checkpoint_path, cfg, args.vocab_size, args.seq_len, args.d_model, args.d_hidden, args.layers)
     else:
+        if checkpoint_path:
+            print(f"Checkpoint {checkpoint_path} not found, initializing new weights.")
         weights = init_model(cfg, args.vocab_size, args.seq_len, args.d_model, args.d_hidden, args.layers, rng, args.init_scale)
 
     if args.prompt:
@@ -523,17 +582,35 @@ def main():
             def decode(self, ids):
                 return "".join([chr(i) if 0 <= i < 128 else "?" for i in ids])
 
-        try:
-            from transformers import AutoTokenizer
-            tokenizer = AutoTokenizer.from_pretrained(args.data_dir)
-        except Exception as e:
-            print(f"Tokenizer load failed ({e}), using simple ASCII tokenizer...")
-            tokenizer = AsciiTokenizer()
+        class NumericTokenizer:
+            def encode(self, text):
+                try:
+                    return [int(tok) for tok in text.strip().split()]
+                except Exception:
+                    return []
+            def decode(self, ids):
+                return " ".join(str(int(i)) for i in ids)
+
+        tokenizer: object
+        # Use numeric tokenizer if prompt looks like integers
+        toks = args.prompt.strip().split()
+        if toks and all(t.isdigit() for t in toks):
+            tokenizer = NumericTokenizer()
+        else:
+            try:
+                from transformers import AutoTokenizer
+                tokenizer = AutoTokenizer.from_pretrained(args.data_dir)
+            except Exception as e:
+                print(f"Tokenizer load failed ({e}), using simple ASCII tokenizer...")
+                tokenizer = AsciiTokenizer()
 
         input_ids = tokenizer.encode(args.prompt)
         output_ids = generate(ctx, weights, input_ids, max_new_tokens=50)
         text = tokenizer.decode(output_ids)
         print(f"Generated: {text}")
+        if save_path:
+            print(f"Saving checkpoint to {save_path}...")
+            save_checkpoint(weights, save_path)
         return
 
     thread_ids = list(range(args.pop_size))
@@ -551,6 +628,9 @@ def main():
             t1_thresh = args.update_threshold_final
             frac = min(1.0, step / max(1, args.steps - 1))
             cfg.update_threshold = int(round(t0_thresh + (t1_thresh - t0_thresh) * frac))
+        # lr schedule (linear decay)
+        frac_lr = min(1.0, step / max(1, args.steps - 1))
+        cfg.learning_rate = lr_start + (lr_end - lr_start) * frac_lr
         ctx.epoch = step
         
         t_batch_start = time.time()
@@ -560,6 +640,18 @@ def main():
         
         # Get batch ONCE for the whole population
         x, y = get_batch(memmap, args.seq_len, batch_size=args.batch_size, rng=rng)
+        # Clamp tokens to vocab size to avoid OOB indices when vocab_size < dataset vocab
+        if x.dtype != mx.int32:
+            x = x.astype(mx.int32)
+        if y.dtype != mx.int32:
+            y = y.astype(mx.int32)
+        x = mx.minimum(x, args.vocab_size - 1)
+        y = mx.minimum(y, args.vocab_size - 1)
+        # Build per-timestep targets by shifting x and appending the final y
+        if x.ndim == 2:
+            y_seq = mx.concatenate([x[:, 1:], y[:, None]], axis=1)
+        else:
+            y_seq = y
         t_batch_end = time.time()
         
         t_forward_start = time.time()
@@ -572,15 +664,15 @@ def main():
                 states_slice = pop_states[:, g_start : g_start + args.group_size]
             
             # Forward
-            logits, states_out = forward_model(ctx, weights, x, g_tids, states_slice)
+            logits, states_out = forward_model(ctx, weights, x, g_tids, states_slice, return_seq_logits=True)
             
             # Compute rewards immediately and discard logits
-            # Broadcast targets: (Batch,) -> (Group, Batch)
-            y_broad = mx.broadcast_to(y[None, ...], (logits.shape[0], y.shape[0]))
-            # Loss per example: (Group, Batch)
+            # Broadcast targets: (Batch,) -> (Group, Batch, Seq)
+            y_broad = mx.broadcast_to(y_seq[None, ...], (logits.shape[0],) + y_seq.shape)
+            # Loss per example/token: (Group, Batch, Seq)
             loss = cross_entropy(logits, y_broad, reduction='none')
-            # Mean over batch -> (Group,)
-            chunk_rewards = -mx.mean(loss, axis=1)
+            # Mean over batch and seq -> (Group,)
+            chunk_rewards = -mx.mean(loss, axis=(1, 2))
             
             rewards_chunks.append(chunk_rewards)
             mx.eval(chunk_rewards) # Ensure logits are freed
@@ -717,11 +809,11 @@ def main():
         # Timing stats
         print(f"  TIMING: Batch={t_batch_end-t_batch_start:.3f}s, Forward={t_forward_end-t_forward_start:.3f}s ({num_chunks} chunks, {(t_forward_end-t_forward_start)/num_chunks:.3f}s/chunk), Concat={t_concat_end-t_concat_start:.3f}s, Update={t_update_end-t_update_start:.3f}s, Log={t_log_end-t_log_start:.3f}s, Total={time.time()-t0:.3f}s")
 
-        if args.save_checkpoint and (step + 1) % args.save_every == 0:
-            save_checkpoint(weights, args.save_checkpoint)
+        if save_path and (step + 1) % args.save_every == 0:
+            save_checkpoint(weights, save_path)
             
-    if args.save_checkpoint:
-        save_checkpoint(weights, args.save_checkpoint)
+    if save_path:
+        save_checkpoint(weights, save_path)
 
 
 if __name__ == "__main__":

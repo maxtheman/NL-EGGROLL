@@ -20,3 +20,7 @@
 5) Alpha/threshold schedule mirroring reference  
    - Implement alpha/threshold decay (e.g., linear or reference schedule) so vote gating and step size reduce over time.  
    - Acceptance: CLI flags to set initial/final alpha/threshold; schedule applied each step; tests confirm values change over steps.
+
+6) NAX investigation (int8 activations)  
+   - Findings: NAX kernels in MLX only instantiate for float/float16/bfloat16; quantized path dequantizes weights to float; no int8 activation/int32 accumulate on NAX. No integer fragment types in `steel/gemm/nax.h`; quantized_nax.metal only builds float-family kernels; gating requires arch gen ≥17, OS ≥15.2, K%64==0 for transpose path, TF32 enabled for float32.  
+   - Next step: Build MLX from source with Metal libs emitted (modify CMake to keep generated metallibs) and run `metal-disassemble` on them to double-check available kernels/symbols.

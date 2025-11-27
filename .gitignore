@@ -7,3 +7,10 @@ __pycache__/
 *.swp
 data/
 checkpoints/
+ckpts/
+*.safetensors
+*.npz
+*.pkl
+archives/external_refs/
+coreml_matmul_models/*.mlpackage/
+coreml_matmul_models/*/Data/com.apple.CoreML/weights/

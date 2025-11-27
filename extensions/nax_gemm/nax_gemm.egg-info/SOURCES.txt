@@ -1,0 +1,7 @@
+README.md
+nax_gemm.mm
+setup.py
+nax_gemm.egg-info/PKG-INFO
+nax_gemm.egg-info/SOURCES.txt
+nax_gemm.egg-info/dependency_links.txt
+nax_gemm.egg-info/top_level.txt
