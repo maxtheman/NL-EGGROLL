@@ -88,3 +88,11 @@ PYTHONPATH=. uv run python scripts/tune_eggroll_optuna.py \
 - MLX/Metal has no int8 activation + int32 accumulate kernel; `mlx.quantized_matmul` dequantizes to float, so this code runs fp16 and cannot match the paper’s int8 path.
 - Large populations and higher rank help signal quality, but convergence remains fragile on M-series.
 - Memory can spike with large group sizes; adjust `group_size` if you hit OOM.
+- Rank=1 struggled even more than rank=4 in my runs, and the update rate was hard to calibrate. Example log at pop=large:
+  ```
+  step 84: loss=4.5791, logits_max=2.5, reward_mean=-3.015, reward_std=0.199
+    reward_range=[-4.197, -2.610], update_rate=100.0000% (62544/62544)
+    update_threshold=0
+    TIMING: Batch=0.000s, Forward=0.262s (1 chunks, 0.262s/chunk), Concat=0.000s, Update=0.002s, Log=0.007s, Total=0.271
+  ```
+  Large population runs fit in memory, but stable learning remained elusive with rank=1; rank=4 behaved better but still fragile.
