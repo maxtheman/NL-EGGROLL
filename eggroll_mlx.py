@@ -41,6 +41,8 @@ class NoiseConfig:
     update_threshold: int = 0  # optional magnitude threshold before applying sign update
     fitness_alpha: float = 0.01  # scale factor for CLT fitness normalization
     debug_perturbations: bool = False  # print noise stats (WARNING: significantly slows down training due to CPU sync)
+    learning_rate: float = 0.01  # step size multiplier for sign updates (fp path)
+    weight_clip: float = 5.0     # optional clip after updates to prevent divergence
 
 
 def fold_in(base_key_int32: Tuple[int, int], new_int32: int | mx.array) -> int | mx.array:
@@ -396,11 +398,11 @@ def apply_sign_update(
         delta = Z_mask.astype(mx.int32)
     else:
         delta = mx.sign(Z).astype(mx.int32)
-    updated = param.astype(mx.int32) + delta
-    updated = mx.clip(updated, -127, 127).astype(param.dtype)
-    
-    num_changed = int(mx.sum(mx.abs(delta)).item())
-    return updated, num_changed
+    updated = param.astype(mx.float32) + cfg.learning_rate * delta.astype(mx.float32)
+    if cfg.weight_clip is not None:
+        updated = mx.clip(updated, -cfg.weight_clip, cfg.weight_clip)
+    num_changed = mx.sum(mx.abs(delta))
+    return updated.astype(param.dtype), num_changed
 
 
 def apply_full_update(
@@ -425,9 +427,10 @@ def apply_full_update(
                 accumulator = accumulator + noise.astype(mx.int32) * score
             else:
                 accumulator = accumulator + mx.sign(noise).astype(mx.int32) * score
-    updated = param.astype(mx.int32) + mx.sign(accumulator)
-    updated = mx.clip(updated, -127, 127).astype(param.dtype)
-    return updated
+    updated = param.astype(mx.float32) + cfg.learning_rate * mx.sign(accumulator).astype(mx.float32)
+    if cfg.weight_clip is not None:
+        updated = mx.clip(updated, -cfg.weight_clip, cfg.weight_clip)
+    return updated.astype(param.dtype)
 
 
 def generate_big_rand(numel: int, seed: int = 0, fixed_point: int = 4, dtype=mx.int8) -> mx.array:
@@ -510,6 +513,18 @@ def int8_matmul(a: mx.array, b: mx.array) -> mx.array:
         threadgroup=(256, 1, 1),
     )[0]
     return mx.reshape(out_flat, (m, n))
+
+
+def quantized_matmul_wrapper(x: mx.array, w: mx.array, scales: mx.array, biases: Optional[mx.array] = None, group_size: int = 64) -> mx.array:
+    """
+    Float matmul wrapper (fp16 -> fp16).
+    x: (..., K) float16/32
+    w: (N, K) float16/32
+    """
+    if x.dtype != mx.float16:
+        x = x.astype(mx.float16)
+    return mx.matmul(x, mx.transpose(w))
+
 
 
 def calibrate_divisor(x: mx.array, w: mx.array, target_max: int = 32) -> int:
