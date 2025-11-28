@@ -12,6 +12,7 @@ on small shapes. It favors clarity over speed; the batched forward dedup lives i
 
 from dataclasses import dataclass
 from typing import Tuple, Optional, List
+import os
 
 import numpy as np
 import mlx.core as mx
@@ -443,11 +444,14 @@ def generate_big_rand(numel: int, seed: int = 0, fixed_point: int = 4, dtype=mx.
     return arr.astype(dtype)
 
 
-_int8_mm_kernel = None
+USE_TILED_INT8_KERNEL = os.getenv("INT8_KERNEL_TILE", "0") == "1"
+_int8_mm_kernel_vec = None
+_int8_mm_kernel_tiled = None
 
 if _HAS_MXFAST:
-    _int8_mm_kernel = mxfast.metal_kernel(
-        name="int8_mm",
+    # Baseline vectorized (one thread per output)
+    _int8_mm_kernel_vec = mxfast.metal_kernel(
+        name="int8_mm_vec",
         input_names=["a", "b", "M", "N", "K"],
         output_names=["out"],
         source=r"""
@@ -481,6 +485,90 @@ if _HAS_MXFAST:
         ensure_row_contiguous=True,
     )
 
+    # Experimental tiled kernel (16x16 tile, TK=32) for tuning
+    _int8_mm_kernel_tiled = mxfast.metal_kernel(
+        name="int8_mm_tiled",
+        input_names=["a", "b", "M", "N", "K"],
+        output_names=["out"],
+        source=r"""
+            constexpr ushort TM = 16;
+            constexpr ushort TN = 16;
+            constexpr ushort TK = 32;
+
+            int Mv = int(M[0]);
+            int Nv = int(N[0]);
+            int Kv = int(K[0]);
+            
+            // 2D Grid Dispatch
+            uint tg_x = threadgroup_position_in_grid.x;
+            uint tg_y = threadgroup_position_in_grid.y;
+            ushort lx = thread_position_in_threadgroup.x; // 0..15 (col in tile)
+            ushort ly = thread_position_in_threadgroup.y; // 0..15 (row in tile)
+            
+            uint row = tg_y * TM + ly;
+            uint col = tg_x * TN + lx;
+            uint tid = ly * TN + lx; // Linear thread ID 0..255
+
+            // Shared Memory
+            threadgroup char Asub[TM * TK];
+            threadgroup char Bsub[TN * TK];
+
+            int32_t acc = 0;
+
+            // Loop over K in chunks of TK
+            for (int k0 = 0; k0 < Kv; k0 += TK) {
+                
+                // Load A tile
+                for (uint i = tid; i < TM * TK; i += 256) {
+                    uint r = i / TK;      // row in tile
+                    uint k = i % TK;      // k in tile
+                    uint global_r = tg_y * TM + r;
+                    uint global_k = k0 + k;
+                    
+                    char val = 0;
+                    if (global_r < (uint)Mv && global_k < (uint)Kv) {
+                        val = a[global_r * Kv + global_k];
+                    }
+                    Asub[i] = val;
+                }
+
+                // Load B tile
+                for (uint i = tid; i < TN * TK; i += 256) {
+                    uint c = i / TK;      // col in tile (row in b)
+                    uint k = i % TK;      // k in tile
+                    uint global_c = tg_x * TN + c;
+                    uint global_k = k0 + k;
+                    
+                    char val = 0;
+                    if (global_c < (uint)Nv && global_k < (uint)Kv) {
+                        val = b[global_c * Kv + global_k];
+                    }
+                    Bsub[i] = val;
+                }
+                
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+
+                // Compute
+                const threadgroup char* A_row = Asub + ly * TK;
+                const threadgroup char* B_col = Bsub + lx * TK;
+                
+                for (int k = 0; k < TK; ++k) {
+                    // Check boundary for partial K tiles
+                    if (k0 + k < Kv) {
+                        acc += int32_t(A_row[k]) * int32_t(B_col[k]);
+                    }
+                }
+                
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+            }
+
+            if (row < (uint)Mv && col < (uint)Nv) {
+                out[row * Nv + col] = acc;
+            }
+        """,
+        ensure_row_contiguous=True,
+    )
+
 
 def int8_matmul(a: mx.array, b: mx.array) -> mx.array:
     """
@@ -489,17 +577,30 @@ def int8_matmul(a: mx.array, b: mx.array) -> mx.array:
     """
     m, k = a.shape
     n = b.shape[0]
-    if _int8_mm_kernel is None:
+    kernel = _int8_mm_kernel_tiled if (USE_TILED_INT8_KERNEL and _int8_mm_kernel_tiled is not None) else _int8_mm_kernel_vec
+    if kernel is None:
         raise RuntimeError("int8 matmul kernel missing; mlx.fast must be available.")
-    # Check for grid size overflow (signed 32-bit limit)
-    # Standard path
-    out_flat = _int8_mm_kernel(
-        inputs=[a, b, mx.array([m], dtype=mx.int32), mx.array([n], dtype=mx.int32), mx.array([k], dtype=mx.int32)],
-        output_shapes=[(int(m * n),)],
-        output_dtypes=[mx.int32],
-        grid=(int(m * n), 1, 1),
-        threadgroup=(256, 1, 1),
-    )[0]
+
+    if kernel is _int8_mm_kernel_tiled:
+        tile_m = 16
+        tile_n = 16
+        grid_x = (n + tile_n - 1) // tile_n
+        grid_y = (m + tile_m - 1) // tile_m
+        out_flat = kernel(
+            inputs=[a, b, mx.array([m], dtype=mx.int32), mx.array([n], dtype=mx.int32), mx.array([k], dtype=mx.int32)],
+            output_shapes=[(int(m * n),)],
+            output_dtypes=[mx.int32],
+            grid=(int(grid_x * 16), int(grid_y * 16), 1),
+            threadgroup=(16, 16, 1),
+        )[0]
+    else:
+        out_flat = kernel(
+            inputs=[a, b, mx.array([m], dtype=mx.int32), mx.array([n], dtype=mx.int32), mx.array([k], dtype=mx.int32)],
+            output_shapes=[(int(m * n),)],
+            output_dtypes=[mx.int32],
+            grid=(int(m * n), 1, 1),
+            threadgroup=(256, 1, 1),
+        )[0]
     return mx.reshape(out_flat, (m, n))
 
 
