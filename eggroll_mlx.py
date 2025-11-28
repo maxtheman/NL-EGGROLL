@@ -509,16 +509,20 @@ if _HAS_MXFAST:
             uint col = tg_x * TN + lx;
             uint tid = ly * TN + lx; // Linear thread ID 0..255
 
-            // Shared Memory
-            threadgroup char Asub[TM * TK];
-            threadgroup char Bsub[TN * TK];
+            // Shared Memory with char4 alignment
+            threadgroup char4 Asub_vec[TM * TK / 4];
+            threadgroup char4 Bsub_vec[TN * TK / 4];
+            
+            // Cast to char* for scalar loading
+            threadgroup char* Asub = (threadgroup char*)Asub_vec;
+            threadgroup char* Bsub = (threadgroup char*)Bsub_vec;
 
             int32_t acc = 0;
 
             // Loop over K in chunks of TK
             for (int k0 = 0; k0 < Kv; k0 += TK) {
                 
-                // Load A tile
+                // Load A tile (Scalar load, vector aligned store)
                 for (uint i = tid; i < TM * TK; i += 256) {
                     uint r = i / TK;      // row in tile
                     uint k = i % TK;      // k in tile
@@ -548,15 +552,18 @@ if _HAS_MXFAST:
                 
                 threadgroup_barrier(mem_flags::mem_threadgroup);
 
-                // Compute
-                const threadgroup char* A_row = Asub + ly * TK;
-                const threadgroup char* B_col = Bsub + lx * TK;
+                // Compute (Vectorized)
+                const threadgroup char4* A_row = Asub_vec + ly * (TK / 4);
+                const threadgroup char4* B_col = Bsub_vec + lx * (TK / 4);
                 
-                for (int k = 0; k < TK; ++k) {
-                    // Check boundary for partial K tiles
-                    if (k0 + k < Kv) {
-                        acc += int32_t(A_row[k]) * int32_t(B_col[k]);
-                    }
+                // Unrolled loop over TK/4 (TK=32 -> 8 iterations)
+                for (int k = 0; k < TK / 4; ++k) {
+                    char4 va = A_row[k];
+                    char4 vb = B_col[k];
+                    acc += int32_t(va.x) * int32_t(vb.x);
+                    acc += int32_t(va.y) * int32_t(vb.y);
+                    acc += int32_t(va.z) * int32_t(vb.z);
+                    acc += int32_t(va.w) * int32_t(vb.w);
                 }
                 
                 threadgroup_barrier(mem_flags::mem_threadgroup);

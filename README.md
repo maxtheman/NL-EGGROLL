@@ -86,6 +86,8 @@ PYTHONPATH=. uv run python scripts/tune_eggroll_optuna.py \
 
 ## Current status and caveats
 - MLX/Metal has no int8 activation + int32 accumulate kernel; `mlx.quantized_matmul` dequantizes to float, so this code runs fp16 and cannot match the paper’s int8 path.
+- We implemented custom int8 Metal kernels (vectorized and tiled) for correctness testing. They are correct but ~80× slower than MLX’s `quantized_matmul`/fp16 path on relevant shapes (e.g., 2048²×512, 4096²×512). That makes it hard to get training signal from int8-only experiments on current hardware.
+- The ES trainer here should be treated as an fp16 approximation; the author of the reference EGGROLL notes the algorithm likely only works in int8, which we can’t reproduce efficiently on MLX today.
 - Large populations and higher rank help signal quality, but convergence remains fragile on M-series.
 - Memory can spike with large group sizes; adjust `group_size` if you hit OOM.
 - Rank=1 struggled even more than rank=4 in my runs, and the update rate was hard to calibrate. Example log at pop=large:
